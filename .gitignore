@@ -1,0 +1,14 @@
+# IDE
+.vscode/
+
+# 下载的 MAA 发布包
+MAA-*.zip
+
+# 解压的 MAA 目录
+MAA-v*-win-x64/
+
+# 构建输出
+bin/
+
+# 子模块（独立仓库）
+MaaAssistantArknights/
