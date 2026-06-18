@@ -6,6 +6,8 @@
     具备下载重试、镜像降级、安装前备份、失败回滚、日志记录、API 缓存等冗余机制。
 .AUTHOR
     bigbee
+.PROJECT
+    https://github.com/bigbee-very/Maa_NoGithub_AutoUpdate#maa-nogithub-autoupdate
 #>
 
 param(
