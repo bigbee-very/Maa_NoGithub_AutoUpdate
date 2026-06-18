@@ -16,7 +16,15 @@ $ProgressPreference = 'SilentlyContinue'
 
 $ApiBase1 = 'https://api.maa.plus/MaaAssistantArknights/api'
 $ApiBase2 = 'https://api2.maa.plus/MaaAssistantArknights/api'
-$MirrorHost = 'https://agent.imgg.dev'
+$MirrorHosts = @(
+    'https://agent.imgg.dev',
+    'https://ghproxy.net/https://github.com',
+    'https://gh-proxy.com/https://github.com'
+)
+$GithubProxies = @(
+    'https://ghproxy.net/',
+    'https://gh-proxy.com/'
+)
 $SummaryApi = 'version/summary.json'
 $RetryMax = 3
 
@@ -136,30 +144,28 @@ $filename = $asset.name
 $originalUrl = $asset.browser_download_url
 $expectedSize = [long]$asset.size
 $filepath = Join-Path $ScriptDir $filename
-$mirrorUrl = $originalUrl -replace 'https://github.com/', "$MirrorHost/"
+$mirrorUrls = $MirrorHosts | ForEach-Object { $originalUrl -replace 'https://github\.com/', "$_/" }
 
 Write-Info "文件名: $filename"
 Write-Info "文件大小: $(Format-FileSize $expectedSize)"
 Write-Info "原始地址: $originalUrl"
-if ($mirrorUrl) { Write-Info "镜像地址: $mirrorUrl" }
+foreach ($mu in $mirrorUrls) { Write-Info "镜像地址: $mu" }
 
-# ======== 下载（镜像 → 原始）========
+# ======== 下载（多镜像轮换 → 代理 → 原始）========
 Write-Step '开始下载'
 
+$tryOrder = @()
+foreach ($mu in $mirrorUrls) { $tryOrder += $mu }
+foreach ($p in $GithubProxies) { $tryOrder += "$p$originalUrl" }
+$tryOrder += $originalUrl
+
 $downloadOk = $false
-
-if ($mirrorUrl) {
-    Write-Info '尝试镜像下载...'
-    if (Start-Download -Url $mirrorUrl -OutFile $filepath -DisplayName $filename -ExpectedSize $expectedSize) {
+foreach ($url in $tryOrder) {
+    if (Start-Download -Url $url -OutFile $filepath -DisplayName $filename -ExpectedSize $expectedSize) {
         $downloadOk = $true
+        break
     }
-}
-
-if (-not $downloadOk) {
-    Write-Info '镜像下载失败，尝试原始 GitHub 地址...'
-    if (Start-Download -Url $originalUrl -OutFile $filepath -DisplayName $filename -ExpectedSize $expectedSize) {
-        $downloadOk = $true
-    }
+    Write-Warn "下载源不可用，尝试下一个..."
 }
 
 if (-not $downloadOk) {

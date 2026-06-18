@@ -109,6 +109,7 @@ $LogFile = Join-Path $ScriptDir "update.log"
 $StateFile = Join-Path $ScriptDir ".update_state"
 $CacheDir = Join-Path $ScriptDir "cache\api"
 $PwshDir = Join-Path $ScriptDir '.pwsh'
+$PwshMarkerFile = Join-Path $ScriptDir '.pwsh_auto_attempted'
 $script:PwshPath = $null
 $script:HasPwsh = $false
 $MaaApiBase = 'https://api.maa.plus/MaaAssistantArknights/api'
@@ -317,12 +318,13 @@ function Find-PwshPath {
     return $false
 }
 
-# ======== pwsh 自动安装 ========
+# ======== pwsh 自动安装（仅首次运行尝试自动下载） ========
 function Ensure-Pwsh {
-    if (Find-PwshPath) { return $true }
     $localPwsh = Join-Path $PwshDir 'pwsh.exe'
+    # 已安装或便携版已存在
+    if (Find-PwshPath) { return $true }
     if (Test-Path $localPwsh) { $script:PwshPath = $localPwsh; $script:HasPwsh = $true; return $true }
-    # 本地安装包检测（用户放到 MAA 目录中的 PowerShell 安装包 .exe / .msi / .zip）
+    # 本地安装包（每次运行都会检查）
     $localInstaller = Get-ChildItem "$ScriptDir\*" -Include 'PowerShell*.exe', 'PowerShell*.msi', 'PowerShell*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($localInstaller) {
         $inst = $localInstaller.FullName
@@ -334,74 +336,45 @@ function Ensure-Pwsh {
             New-Directory $PwshDir; Expand-Zip $inst $PwshDir
             if (Test-Path $localPwsh) { $script:PwshPath = $localPwsh; $script:HasPwsh = $true; Remove-Item -Force $inst; Write-Ok 'PowerShell 便携版就绪'; return $true }
         } elseif ($inst -match '\.exe$') {
-            if ($script:IsAdmin) {
-                $p = Start-Process $inst -ArgumentList '/quiet', 'ADD_PATH=1' -Wait -PassThru -NoNewWindow
-            } else {
-                $p = Start-Process $inst -Wait -PassThru -NoNewWindow
-            }
+            $p = if ($script:IsAdmin) { Start-Process $inst -ArgumentList '/quiet', 'ADD_PATH=1' -Wait -PassThru -NoNewWindow } else { Start-Process $inst -Wait -PassThru -NoNewWindow }
             if ($p.ExitCode -eq 0 -and (Find-PwshPath)) { Remove-Item -Force $inst; Write-Ok 'PowerShell 7 安装成功'; return $true }
         }
-        Write-Warn "本地安装包处理失败，尝试网络下载..."
+        Write-Warn "本地安装包处理失败"
     }
-    Write-Info 'PowerShell 7 未安装，尝试网络下载...'
+    # 已尝试过自动下载 → 仅提示
+    if (Test-Path $PwshMarkerFile) {
+        Write-Warn 'PowerShell 7 未安装。HTTP/2 下载不可用，可能影响资源更新。'
+        Write-Warn '请从微软商店安装：https://apps.microsoft.com/detail/9mz1snwt0n5d?hl=zh-CN&gl=CN'
+        return $false
+    }
+    # 首次运行：自动尝试安装
+    Write-Info 'PowerShell 7 未安装，首次运行尝试自动下载...'
     $pwshVer = '7.6.2'
-    # 1) winget 全局安装（直连 GitHub，速度最快，优先尝试）
     $wg = Get-Command 'winget' -ErrorAction SilentlyContinue
     if ($wg) {
         Write-Info '使用 winget 安装 PowerShell（正在下载，请耐心等待）...'
         $p = Start-Process winget -ArgumentList 'install', '--id', 'Microsoft.PowerShell', '--source', 'winget', '--installer-type', 'wix', '--silent', '--accept-package-agreements' -NoNewWindow -PassThru
         $done = $p.WaitForExit(300000)
         if (-not $done) { $p.Kill(); Write-Warn 'winget 超时' }
-        else { Start-Sleep 2; if (Find-PwshPath) { return $true } }
+        else { Start-Sleep 2; if (Find-PwshPath) { New-Item -Force $PwshMarkerFile | Out-Null; return $true } }
     }
-    # 也检查系统是否已经装了 pwsh（PATH 未刷新时兜底）
-    if (Find-PwshPath) { return $true }
-    # 2) MSI 镜像下载 + 静默安装（需管理员）
+    if (Find-PwshPath) { New-Item -Force $PwshMarkerFile | Out-Null; return $true }
     if ($script:IsAdmin) {
         $msiUrl = "https://github.com/PowerShell/PowerShell/releases/download/v$pwshVer/PowerShell-$pwshVer-win-x64.msi"
-        $msiUrls = @(
-            "https://gh-proxy.com/$msiUrl",
-            "https://ghproxy.net/$msiUrl",
-            $msiUrl
-        )
         $msiFile = Join-Path $TempDir "PowerShell-$pwshVer-win-x64.msi"
-        foreach ($u in $msiUrls) {
+        foreach ($u in @("https://gh-proxy.com/$msiUrl", "https://ghproxy.net/$msiUrl", $msiUrl)) {
             if (Start-Download -Url $u -OutFile $msiFile -DisplayName "PowerShell $pwshVer MSI") { break }
         }
         if ((Test-Path $msiFile) -and ((Get-Item $msiFile).Length -gt 1MB)) {
             Write-Info '正在静默安装 PowerShell 7...'
             $p = Start-Process msiexec.exe -ArgumentList "/package `"$msiFile`" /quiet ADD_PATH=1" -Wait -PassThru -NoNewWindow
             Remove-Item -Force $msiFile -ErrorAction SilentlyContinue
-            if ($p.ExitCode -eq 0) {
-                $e = Get-Command 'pwsh' -ErrorAction SilentlyContinue
-                if ($e) { $script:PwshPath = $e.Source; $script:HasPwsh = $true; Write-Ok 'PowerShell 7 安装成功'; return $true }
-            }
-            Write-Warn 'MSI 静默安装失败，尝试其他方式...'
+            if ($p.ExitCode -eq 0 -and (Find-PwshPath)) { New-Item -Force $PwshMarkerFile | Out-Null; return $true }
         }
     }
-    # 3) ZIP 便携版（无需管理员，走镜像，去 speed-limit 避免慢速误杀）
-    $pwshZip = Join-Path $TempDir "PowerShell-$pwshVer-win-x64.zip"
-    $pwshUrl = "https://github.com/PowerShell/PowerShell/releases/download/v$pwshVer/PowerShell-$pwshVer-win-x64.zip"
-    $zipUrls = @("https://gh-proxy.com/$pwshUrl", "https://ghproxy.net/$pwshUrl", $pwshUrl)
-    $zipOk = $false
-    foreach ($u in $zipUrls) {
-        $tmp = Join-Path $TempDir "pwsh_tmp.zip"
-        try {
-            Show-Wait "正在下载 PowerShell $pwshVer ZIP..."
-            if ($script:HasCurl) {
-                & curl.exe -L -f -o $tmp --connect-timeout 15 --max-time 600 -s $u 2>$null
-                if ($LASTEXITCODE -eq 0 -and (Test-Path $tmp) -and ((Get-Item $tmp).Length -gt 1MB)) { Move-Item -Force $tmp $pwshZip; $zipOk = $true; break }
-            }
-        } catch { continue }
-        finally { if (Test-Path $tmp) { Remove-Item -Force $tmp -ErrorAction SilentlyContinue } }
-    }
-    if ($zipOk -and (Test-Path $pwshZip)) {
-        New-Directory $PwshDir
-        Expand-Zip $pwshZip $PwshDir
-        Remove-Item -Force $pwshZip -ErrorAction SilentlyContinue
-        if (Test-Path $localPwsh) { $script:PwshPath = $localPwsh; $script:HasPwsh = $true; Write-Ok 'PowerShell 便携版就绪'; return $true }
-    }
-    Write-Warn '所有下载方式均失败。可手动从微软商店安装 PowerShell 7：'
+    # 创建标记，下次不再自动下载
+    New-Item -Force $PwshMarkerFile | Out-Null
+    Write-Warn 'PowerShell 7 自动安装失败。请从微软商店安装：'
     Write-Warn 'https://apps.microsoft.com/detail/9mz1snwt0n5d?hl=zh-CN&gl=CN'
     return $false
 }
@@ -918,7 +891,7 @@ function Update-Resource {
     Write-Info "发现新资源 ($($remoteJson.last_updated))"
     if ($DryRun) { Write-Warn '仅检查模式，跳过资源下载'; return $null }
 
-    # 资源包下载 - 多源重试（HTTP/2 优先 → curl → 分段 → BITS）
+    # 资源包下载 - 多源多策略重试
     $resZip = Join-Path $TempDir 'MaaResource.zip'
     $dlOk = $false
     $resUrls = @(
@@ -927,9 +900,13 @@ function Update-Resource {
         "https://ghproxy.net/$ResourceArchiveUrl"
     )
     if (-not $script:HasPwsh) { Write-Info 'pwsh 不可用，HTTP/2 下载将被跳过' }
-    foreach ($rurl in $resUrls) {
-        if (Start-Download -Url $rurl -OutFile $resZip -DisplayName '游戏资源包') { $dlOk = $true; break }
-        Write-Warn "资源下载源不可用: $rurl"
+    for ($try = 1; $try -le 2; $try++) {
+        if ($try -gt 1) { Write-Info "资源下载重试第 $try 次..."; Start-Sleep 2 }
+        foreach ($rurl in $resUrls) {
+            if (Start-Download -Url $rurl -OutFile $resZip -DisplayName '游戏资源包') { $dlOk = $true; break }
+            Write-Warn "资源下载源不可用: $rurl"
+        }
+        if ($dlOk) { break }
     }
     if (-not $dlOk) { Write-Err '资源下载失败'; return $false }
 
