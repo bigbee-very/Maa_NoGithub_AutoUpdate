@@ -96,7 +96,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "Maa-Update.ps1" > update_lo
 1. 先下载更新包（MAA 仍在运行，不影响使用）
 2. 下载完成 → 自动关闭 MAA → 备份旧文件 → 安装 → 重新启动 MAA
 
-### 断电续传
+### 断点续传
 
 - 使用 `.update_state` 文件记录状态，重新运行从断点继续
 - 恢复失败时删除 `.update_state` 和 `.update_temp` 即可从头开始
