@@ -51,48 +51,64 @@ function Start-Download {
 
     Write-Host '⚠ 正在下载，请不要关闭此窗口！根据网络状况可能需要几分钟。' -ForegroundColor Black -BackgroundColor Yellow
 
-    $useCurl = $null -ne (Get-Command curl.exe -ErrorAction SilentlyContinue)
+    $hasCurl = $null -ne (Get-Command curl.exe -ErrorAction SilentlyContinue)
 
+    # 1. curl（优先，TCP 栈优于 .NET）
+    if ($hasCurl) {
+        for ($try = 1; $try -le $RetryMax; $try++) {
+            if ($try -gt 1) {
+                Write-Warn "curl 重试 ($try/$RetryMax)..."
+                Start-Sleep 2
+            }
+            try {
+                if (Test-Path $OutFile) { Remove-Item -Force $OutFile }
+                Write-Info "使用 curl.exe 下载..."
+                $result = curl.exe -sSfL -o "$OutFile" "$Url" -A 'MAA-DL/1.0' --connect-timeout 15 --max-time 600 2>&1
+                if ($LASTEXITCODE -ne 0) { throw "curl 返回退出码 $LASTEXITCODE : $result" }
+                if (-not (Test-Path $OutFile)) { throw "输出文件未创建" }
+                $actualSize = (Get-Item $OutFile).Length
+                if ($ExpectedSize -gt 0 -and $actualSize -ne $ExpectedSize) {
+                    Write-Warn "文件大小不匹配: 期望 $(Format-FileSize $ExpectedSize), 实际 $(Format-FileSize $actualSize)"
+                    Remove-Item -Force $OutFile -ErrorAction SilentlyContinue; continue
+                }
+                Write-Ok "$DisplayName 下载完成 ($(Format-FileSize $actualSize))"
+                return $true
+            }
+            catch {
+                Write-Warn "curl 失败: $($_.Exception.Message.Trim())"
+                Remove-Item -Force $OutFile -ErrorAction SilentlyContinue
+            }
+        }
+        Write-Warn "curl 下载失败，切换到 WebClient..."
+    }
+
+    # 2. WebClient（兜底）
     for ($try = 1; $try -le $RetryMax; $try++) {
         if ($try -gt 1) {
-            Write-Warn "下载重试 ($try/$RetryMax)..."
+            Write-Warn "WebClient 重试 ($try/$RetryMax)..."
             Start-Sleep 2
         }
         try {
             if (Test-Path $OutFile) { Remove-Item -Force $OutFile }
-
-            if ($useCurl) {
-                Write-Info "使用 curl.exe 下载..."
-                $result = curl.exe -sSfL -o "$OutFile" "$Url" -A 'MAA-DL/1.0' --connect-timeout 15 --max-time 600 2>&1
-                if ($LASTEXITCODE -ne 0) {
-                    throw "curl 返回退出码 $LASTEXITCODE : $result"
-                }
-            }
-            else {
-                Write-Info "使用 WebClient 下载..."
-                $wc = New-Object System.Net.WebClient
-                $wc.Headers.Add('User-Agent', 'MAA-DL/1.0')
-                $wc.DownloadFile($Url, $OutFile)
-            }
-
-            if (-not (Test-Path $OutFile)) {
-                throw "输出文件未创建"
-            }
+            Write-Info "使用 WebClient 下载..."
+            $wc = New-Object System.Net.WebClient
+            $wc.Headers.Add('User-Agent', 'MAA-DL/1.0')
+            $wc.DownloadFile($Url, $OutFile)
+            if (-not (Test-Path $OutFile)) { throw "输出文件未创建" }
             $actualSize = (Get-Item $OutFile).Length
             if ($ExpectedSize -gt 0 -and $actualSize -ne $ExpectedSize) {
                 Write-Warn "文件大小不匹配: 期望 $(Format-FileSize $ExpectedSize), 实际 $(Format-FileSize $actualSize)"
-                Remove-Item -Force $OutFile -ErrorAction SilentlyContinue
-                continue
+                Remove-Item -Force $OutFile -ErrorAction SilentlyContinue; continue
             }
             Write-Ok "$DisplayName 下载完成 ($(Format-FileSize $actualSize))"
             return $true
         }
         catch {
-            Write-Warn "下载失败: $($_.Exception.Message.Trim())"
+            Write-Warn "WebClient 失败: $($_.Exception.Message.Trim())"
             Remove-Item -Force $OutFile -ErrorAction SilentlyContinue
         }
     }
-    Write-Err "$DisplayName 下载失败（已重试 $RetryMax 次）"
+    Write-Err "$DisplayName 下载失败（curl、WebClient 均不可用）"
     return $false
 }
 
