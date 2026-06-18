@@ -1,6 +1,6 @@
 ﻿<#:
 .SYNOPSIS
-    MAA 一键更新脚本 — 无代理 v2.1（带故障冗余）
+    MAA 一键更新脚本 — 无代理 v2.2（带故障冗余）
 .DESCRIPTION
     放置于 MAA 安装目录下直接运行。
     具备下载重试、镜像降级、安装前备份、失败回滚、日志记录、API 缓存等冗余机制。
@@ -171,7 +171,7 @@ function Invoke-GetJson {
     try {
         $req = [System.Net.HttpWebRequest]::Create($Url)
         $req.Method = 'GET'; $req.Timeout = $TimeoutSec * 1000; $req.ReadWriteTimeout = $TimeoutSec * 1000
-        $req.UserAgent = 'MAA-Update/2.0'
+        $req.UserAgent = 'MAA-Update/2.2'
         $resp = $req.GetResponse()
         $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
         $json = $reader.ReadToEnd(); $resp.Close(); $reader.Close()
@@ -185,7 +185,7 @@ function Get-FileSize {
     try {
         $req = [System.Net.HttpWebRequest]::Create($Url)
         $req.Method = 'HEAD'; $req.Timeout = $TimeoutSec * 1000; $req.ReadWriteTimeout = $TimeoutSec * 1000
-        $req.UserAgent = 'MAA-Update/2.0'
+        $req.UserAgent = 'MAA-Update/2.2'
         $resp = $req.GetResponse()
         $size = $resp.ContentLength; $resp.Close()
         return [long]$size
@@ -228,7 +228,7 @@ function Start-SegmentedDownload {
         # HEAD 获取总大小
         $req = [System.Net.HttpWebRequest]::Create($Url)
         $req.Method = 'HEAD'; $req.Timeout = 10000; $req.ReadWriteTimeout = 10000
-        $req.UserAgent = 'MAA-Update/2.0'
+        $req.UserAgent = 'MAA-Update/2.2'
         $resp = $req.GetResponse()
         $totalLen = $resp.ContentLength; $resp.Close()
         if ($totalLen -le $MinSize) { return $false }
@@ -257,7 +257,7 @@ function Start-SegmentedDownload {
                     param($u, $f, $t, $o)
                     $r = [System.Net.HttpWebRequest]::Create($u)
                     $r.Method = 'GET'; $r.Timeout = 30000; $r.ReadWriteTimeout = 120000
-                    $r.UserAgent = 'MAA-Update/2.0'; $r.AddRange($f, $t)
+                    $r.UserAgent = 'MAA-Update/2.2'; $r.AddRange($f, $t)
                     $s = $r.GetResponse().GetResponseStream()
                     $fs = [System.IO.File]::Create($o)
                     $buf = New-Object byte[] 65536
@@ -329,7 +329,14 @@ function Ensure-Pwsh {
     # 已安装或便携版已存在
     if (Find-PwshPath) { return $true }
     if (Test-Path $localPwsh) { $script:PwshPath = $localPwsh; $script:HasPwsh = $true; return $true }
-    # 本地安装包（每次运行都会检查）
+    # 已尝试过自动安装 → 仅提示，不再检查本地安装包或下载
+    if (Test-Path $PwshMarkerFile) {
+        Write-Warn 'PowerShell 7 未安装。HTTP/2 下载不可用，可能影响资源更新。'
+        Write-Warn '请从微软商店安装：https://apps.microsoft.com/detail/9mz1snwt0n5d?hl=zh-CN&gl=CN'
+        return $false
+    }
+    # 首次运行：检查本地安装包 + 自动下载
+    Write-Info 'PowerShell 7 未安装，首次运行尝试安装...'
     $localInstaller = Get-ChildItem "$ScriptDir\*" -Include 'PowerShell*.exe', 'PowerShell*.msi', 'PowerShell*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($localInstaller) {
         $inst = $localInstaller.FullName
@@ -345,12 +352,6 @@ function Ensure-Pwsh {
             if ($p.ExitCode -eq 0 -and (Find-PwshPath)) { Remove-Item -Force $inst; Write-Ok 'PowerShell 7 安装成功'; return $true }
         }
         Write-Warn "本地安装包处理失败"
-    }
-    # 已尝试过自动下载 → 仅提示
-    if (Test-Path $PwshMarkerFile) {
-        Write-Warn 'PowerShell 7 未安装。HTTP/2 下载不可用，可能影响资源更新。'
-        Write-Warn '请从微软商店安装：https://apps.microsoft.com/detail/9mz1snwt0n5d?hl=zh-CN&gl=CN'
-        return $false
     }
     # 首次运行：自动尝试安装
     Write-Info 'PowerShell 7 未安装，首次运行尝试自动下载...'
@@ -399,7 +400,7 @@ try {
     `$h = [System.Net.Http.SocketsHttpHandler]::new()
     `$h.EnableMultipleHttp2Connections = `$true
     `$c = [System.Net.Http.HttpClient]::new(`$h)
-    `$c.DefaultRequestHeaders.UserAgent.ParseAdd('MAA-Update/2.0')
+    `$c.DefaultRequestHeaders.UserAgent.ParseAdd('MAA-Update/2.2')
     `$c.Timeout = [TimeSpan]::FromSeconds(600)
     `$r = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, `$u)
     `$r.Version = [System.Net.HttpVersion]::Version20
@@ -470,7 +471,7 @@ function Start-Download {
         try {
             $req = [System.Net.HttpWebRequest]::Create($Url)
             $req.Method = 'GET'; $req.Timeout = 15000; $req.ReadWriteTimeout = 60000
-            $req.UserAgent = 'MAA-Update/2.0'
+            $req.UserAgent = 'MAA-Update/2.2'
             $resp = $req.GetResponse()
             $totalLen = $resp.ContentLength
             $stream = $resp.GetResponseStream()
@@ -950,7 +951,7 @@ function Cleanup-Temp {
 try {
     # 清旧日志，写新日志
     if (Test-Path $LogFile) { Remove-Item -Force $LogFile -ErrorAction SilentlyContinue }
-    Write-Log 'INFO' "=== MAA 更新脚本 v2.0 启动 ==="
+    Write-Log 'INFO' "=== MAA 更新脚本 v2.2 启动 ==="
     Write-Log 'INFO' "目录: $ScriptDir | 通道: $Channel"
     if ($Force) { Write-Warn '强制更新模式' }
     if ($DryRun) { Write-Warn '仅检查模式（不下载）' }

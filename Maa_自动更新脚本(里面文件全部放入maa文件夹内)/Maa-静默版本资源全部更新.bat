@@ -1,3 +1,4 @@
 @echo off
 title MAA Update
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Maa-Update.ps1" %*
+start "" /MIN powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Maa-Update.ps1" %*
+exit

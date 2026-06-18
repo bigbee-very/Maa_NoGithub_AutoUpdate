@@ -50,7 +50,7 @@ MAA 自动更新脚本 - 使用说明
   3. 名称填 "MAA 自动更新"，触发器选每天（或每周）
   4. 操作选"启动程序"，程序填 powershell
   5. 参数填：
-     -NoProfile -ExecutionPolicy Bypass -File "C:\你的MAA路径\Maa-Update.ps1"
+     -NoProfile -ExecutionPolicy Bypass -File "C:\你的MAA路径\Maa-静默版本资源全部更新.bat"
   6. 如需只更新版本（不更新资源），在参数末尾加 -SkipResource
   7. 完成
 
