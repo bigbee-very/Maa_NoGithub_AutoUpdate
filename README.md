@@ -3,9 +3,10 @@
 针对无法正常访问 GitHub 的用户，提供的 MAA 下载与更新工具集。
 
 百度网盘链接
+
 通过网盘分享的文件：Maa_NoGithub_Update.zip
 
-链接: https://pan.baidu.com/s/149L3c4TkoXrotD5uiAMIDw?pwd=1234 提取码: 1234
+链接: https://pan.baidu.com/s/1s4JVswcoIS6lAPUKvk1lHw?pwd=1234 提取码: 1234
 
 ## 目录结构
 
@@ -144,6 +145,7 @@ A: 脚本自动保留备份在 `.update_backup`，手动覆盖回 MAA 目录即�
 A: 只下载和旧版本有差异的文件，通常几 MB 到十几 MB，比完整包（几百 MB）快得多。
 
 ## 免责声明
+
 - 测试最早6.10.7版本,更古老版本无法确定正常使用.
 - 纯vibe coding产物,不保证稳定运行.
 - 本工具集为第三方维护的社区工具，与 MAA 官方无直接关联。
