@@ -49,7 +49,7 @@ function Resolve-DomainFast {
                 foreach ($line in $raw) {
                     if ($line -match '(\d+\.\d+\.\d+\.\d+)') { $ips += $matches[1] }
                 }
-                $ips = $ips | Select-Object -Unique | Where-Object { $_ -ne $Domain }
+                $ips = $ips | Select-Object -Unique | Where-Object { $_ -ne $Domain -and $_ -ne $dns }
             }
         }
         catch { continue }
@@ -85,8 +85,8 @@ function Initialize-DnsAccel {
                 if ($script:HasCurl) { $script:CurlResolve += "--resolve", "$dom`:443`:$bestIp", "--resolve", "$dom`:80`:$bestIp" }
                 if ($script:IsAdmin) {
                     $content = Get-Content $script:HostsPath -Raw -ErrorAction SilentlyContinue
-                    if ($content) { $content = $content -replace "(?m)^\d+\.\d+\.\d+\.\d+\s+$dom\s*`n", '' }
-                    "$bestIp $dom" | Out-File $script:HostsPath -Append -Encoding ASCII
+                    if ($content) { $content = $content -replace "(?m)^\d+\.\d+\.\d+\.\d+\s+$dom\s+$HostsMarker\s*`n", '' }
+                    "$bestIp $dom $HostsMarker" | Out-File $script:HostsPath -Append -Encoding ASCII
                 }
             }
         }
@@ -97,9 +97,7 @@ function Cleanup-DnsAccel {
     if ($script:IsAdmin -and (Test-Path $script:HostsPath)) {
         $content = Get-Content $script:HostsPath -Raw -ErrorAction SilentlyContinue
         if ($content) {
-            foreach ($dom in $SlowDomains) {
-                $content = $content -replace "(?m)^\d+\.\d+\.\d+\.\d+\s+$dom\s*`n", ''
-            }
+            $content = $content -replace "(?m)^.*$HostsMarker\s*`n", ''
             Set-Content $script:HostsPath -Value $content -Encoding ASCII
         }
     }
