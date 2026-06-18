@@ -5,7 +5,9 @@
 MAA（Maa Assistant Arknights，明日方舟游戏助手）是一个开源项目，最新版本放在 GitHub 上。
 但 GitHub 在国内访问很慢甚至打不开，本项目就是为了解决"下不了、更新不了 MAA"的问题。
 
-百度网盘链接：https://pan.baidu.com/s/1EhcMHdyUzN_iFOwh8Qs3aQ?pwd=1234 提取码: 1234
+百度网盘链接：
+
+链接: https://pan.baidu.com/s/1mfVm9n8jkzztyhGiG_RD2g?pwd=1234 提取码: 1234
 
 ## 目录结构
 
