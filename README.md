@@ -1,4 +1,4 @@
-# Maa NoGithub Update
+# Maa NoGithub AutoUpdate
 
 针对无法正常访问 GitHub 的用户，提供的 MAA 下载与更新工具集。
 
