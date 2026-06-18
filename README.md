@@ -2,6 +2,11 @@
 
 针对无法正常访问 GitHub 的用户，提供的 MAA 下载与更新工具集。
 
+百度网盘链接
+通过网盘分享的文件：Maa_NoGithub_Update.zip
+
+链接: https://pan.baidu.com/s/149L3c4TkoXrotD5uiAMIDw?pwd=1234 提取码: 1234
+
 ## 目录结构
 
 ```
