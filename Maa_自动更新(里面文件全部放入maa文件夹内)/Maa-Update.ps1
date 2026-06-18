@@ -22,7 +22,7 @@ $script:HasCurl = $null -ne (Get-Command 'curl.exe' -ErrorAction SilentlyContinu
 $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 # ======== DNS 加速（中国 DNS 解析 + 测速 + hosts/curl-resolve） ========
-$DnsChina = @('223.5.5.5', '114.114.114.114')
+$DnsChina = @('223.5.5.5', '114.114.114.114', '119.29.29.29')
 $SlowDomains = @('raw.githubusercontent.com', 'github.com', 'codeload.github.com')
 $script:BestIps = @{}
 $script:HostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
@@ -37,7 +37,8 @@ function Resolve-DomainFast {
             if ($dns -eq 'System') {
                 $entry = [System.Net.Dns]::GetHostEntry($Domain)
                 $ips = $entry.AddressList | Where-Object { $_ -is [System.Net.IPAddress] -and $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.ToString() }
-            } else {
+            }
+            else {
                 $raw = & nslookup $Domain $dns 2>$null
                 if ($LASTEXITCODE -ne 0) { continue }
                 $ips = @()
@@ -46,7 +47,8 @@ function Resolve-DomainFast {
                 }
                 $ips = $ips | Select-Object -Unique | Where-Object { $_ -ne $Domain }
             }
-        } catch { continue }
+        }
+        catch { continue }
         if ($ips.Count -gt 0) { return $ips }
     }
     return @()
@@ -84,7 +86,8 @@ function Initialize-DnsAccel {
                 }
             }
         }
-    } catch { Write-Warn "DNS 加速失败: $_" }
+    }
+    catch { Write-Warn "DNS 加速失败: $_" }
 }
 function Cleanup-DnsAccel {
     if ($script:IsAdmin -and (Test-Path $script:HostsPath)) {
@@ -105,22 +108,29 @@ $BackupDir = Join-Path $ScriptDir ".update_backup"
 $LogFile = Join-Path $ScriptDir "update.log"
 $StateFile = Join-Path $ScriptDir ".update_state"
 $CacheDir = Join-Path $ScriptDir "cache\api"
+$PwshDir = Join-Path $ScriptDir '.pwsh'
+$script:PwshPath = $null
+$script:HasPwsh = $false
 $MaaApiBase = 'https://api.maa.plus/MaaAssistantArknights/api'
 $MaaApiBase2 = 'https://api2.maa.plus/MaaAssistantArknights/api'
 $MirrorHosts = @(
     'https://agent.imgg.dev',
-    'https://ghproxy.net/https://github.com'
+    'https://ghproxy.net/https://github.com',
+    'https://gh-proxy.com/https://github.com'
 )
-$GithubProxies = @()
+$GithubProxies = @(
+    'https://ghproxy.net/',
+    'https://gh-proxy.com/'
+)
 $ResourceRepo = 'MaaAssistantArknights/MaaResource'
 $ResourceArchiveUrl = "https://github.com/$ResourceRepo/archive/refs/heads/main.zip"
 $ResourceVersionUrl = "https://raw.githubusercontent.com/$ResourceRepo/main/resource/version.json"
 $SummaryApi = 'version/summary.json'
-$MaxRetries = 3
+$MaxRetries = 2
 $PreserveDirs = @('achievement', 'background', 'cache', 'config', 'data', 'debug')
 
 # ======== 等待提示（所有操作用） ========
-function Show-Wait  { param([string]$Msg) Write-Host "  ⏳ $Msg" -ForegroundColor DarkYellow }
+function Show-Wait { param([string]$Msg) Write-Host "  ⏳ $Msg" -ForegroundColor DarkYellow }
 
 # ======== 日志 ========
 function Write-Log {
@@ -129,25 +139,25 @@ function Write-Log {
     $line = "[$time][$Level] $Message"
     Add-Content -Path $LogFile -Value $line -Encoding UTF8
     switch ($Level) {
-        'INFO'    { Write-Host "[信息] $Message" -ForegroundColor Cyan }
-        'OK'      { Write-Host "[成功] $Message" -ForegroundColor Green }
-        'WARN'    { Write-Host "[注意] $Message" -ForegroundColor Yellow }
-        'ERROR'   { Write-Host "[错误] $Message" -ForegroundColor Red }
-        'STEP'    { Write-Host "`n>>> $Message" -ForegroundColor Magenta }
+        'INFO' { Write-Host "[信息] $Message" -ForegroundColor Cyan }
+        'OK' { Write-Host "[成功] $Message" -ForegroundColor Green }
+        'WARN' { Write-Host "[注意] $Message" -ForegroundColor Yellow }
+        'ERROR' { Write-Host "[错误] $Message" -ForegroundColor Red }
+        'STEP' { Write-Host "`n>>> $Message" -ForegroundColor Magenta }
     }
 }
 
-function Write-Step  { Write-Log 'STEP' $args }
-function Write-Info  { Write-Log 'INFO' $args }
-function Write-Ok    { Write-Log 'OK' $args }
-function Write-Warn  { Write-Log 'WARN' $args }
-function Write-Err   { Write-Log 'ERROR' $args }
+function Write-Step { Write-Log 'STEP' $args }
+function Write-Info { Write-Log 'INFO' $args }
+function Write-Ok { Write-Log 'OK' $args }
+function Write-Warn { Write-Log 'WARN' $args }
+function Write-Err { Write-Log 'ERROR' $args }
 
 # ======== 状态管理 ========
 function Set-State {
     param([string]$Phase, [string]$Version = '', [string]$Detail = '')
     @{ Phase = $Phase; Version = $Version; Detail = $Detail; Time = (Get-Date -Format 'o') } |
-        ConvertTo-Json -Compress | Set-Content $StateFile -Encoding UTF8
+    ConvertTo-Json -Compress | Set-Content $StateFile -Encoding UTF8
 }
 
 function Clear-State { if (Test-Path $StateFile) { Remove-Item -Force $StateFile } }
@@ -163,7 +173,8 @@ function Invoke-GetJson {
         $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
         $json = $reader.ReadToEnd(); $resp.Close(); $reader.Close()
         return ($json | ConvertFrom-Json)
-    } catch { return $null }
+    }
+    catch { return $null }
 }
 
 function Get-FileSize {
@@ -175,7 +186,8 @@ function Get-FileSize {
         $resp = $req.GetResponse()
         $size = $resp.ContentLength; $resp.Close()
         return [long]$size
-    } catch { return -1 }
+    }
+    catch { return -1 }
 }
 
 function Format-FileSize {
@@ -193,12 +205,14 @@ function Expand-Zip {
         Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
         [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $DestDir)
         return
-    } catch { Write-Warn "ZipFile 解压失败，尝试 Shell COM..." }
+    }
+    catch { Write-Warn "ZipFile 解压失败，尝试 Shell COM..." }
     try {
         $shell = New-Object -ComObject Shell.Application
         $shell.NameSpace($DestDir).CopyHere($shell.NameSpace($ZipPath).Items(), 16)
         return
-    } catch { throw "无法解压文件" }
+    }
+    catch { throw "无法解压文件" }
 }
 
 function New-Directory { param([string]$Path) if (-not (Test-Path $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null } }
@@ -215,7 +229,8 @@ function Start-SegmentedDownload {
         $resp = $req.GetResponse()
         $totalLen = $resp.ContentLength; $resp.Close()
         if ($totalLen -le $MinSize) { return $false }
-    } catch { return $false }
+    }
+    catch { return $false }
 
     try {
         Write-Info "启用分片下载 ($Segments 片, 共 $(Format-FileSize $totalLen))"
@@ -235,26 +250,34 @@ function Start-SegmentedDownload {
             $ps = [PowerShell]::Create()
             $ps.RunspacePool = $pool
             $null = $ps.AddScript({
-                param($u, $f, $t, $o)
-                $r = [System.Net.HttpWebRequest]::Create($u)
-                $r.Method = 'GET'; $r.Timeout = 30000; $r.ReadWriteTimeout = 120000
-                $r.UserAgent = 'MAA-Update/2.0'; $r.AddRange($f, $t)
-                $s = $r.GetResponse().GetResponseStream()
-                $fs = [System.IO.File]::Create($o)
-                $buf = New-Object byte[] 65536
-                while (($rd = $s.Read($buf, 0, $buf.Length)) -gt 0) { $fs.Write($buf, 0, $rd) }
-                $fs.Close(); $s.Close()
-            }).AddParameters(@{u=$Url; f=$from; t=$to; o=$segFile})
+                    param($u, $f, $t, $o)
+                    $r = [System.Net.HttpWebRequest]::Create($u)
+                    $r.Method = 'GET'; $r.Timeout = 30000; $r.ReadWriteTimeout = 120000
+                    $r.UserAgent = 'MAA-Update/2.0'; $r.AddRange($f, $t)
+                    $s = $r.GetResponse().GetResponseStream()
+                    $fs = [System.IO.File]::Create($o)
+                    $buf = New-Object byte[] 65536
+                    while (($rd = $s.Read($buf, 0, $buf.Length)) -gt 0) { $fs.Write($buf, 0, $rd) }
+                    $fs.Close(); $s.Close()
+                }).AddParameters(@{u = $Url; f = $from; t = $to; o = $segFile })
             $segTasks += $ps.BeginInvoke()
         }
 
         $failed = $false
         for ($i = 0; $i -lt $Segments; $i++) {
-            try { $segTasks[$i].AsyncWaitHandle.WaitOne() | Out-Null } catch { $failed = $true }
+            try {
+                $segTasks[$i].AsyncWaitHandle.WaitOne() | Out-Null
+                $segTasks[$i] = $ps.EndInvoke($segTasks[$i])
+            } catch { $failed = $true; Write-Warn "分片 $i 下载失败: $_" }
         }
         $pool.Close(); $pool.Dispose()
 
         if ($failed) { throw '分片下载失败' }
+
+        # 合并前检查所有分片存在且非空
+        foreach ($f in $segFiles) {
+            if (-not (Test-Path $f) -or (Get-Item $f).Length -eq 0) { throw "分片文件缺失或为空: $f" }
+        }
 
         $fsOut = [System.IO.File]::Create($OutFile)
         foreach ($f in $segFiles) {
@@ -271,16 +294,168 @@ function Start-SegmentedDownload {
         }
         Write-Ok "$DisplayName 下载完成 ($(Format-FileSize $actualSize), 分片)"
         return $true
-    } catch {
+    }
+    catch {
         Write-Warn "分片下载失败，回退单线程: $_"
         foreach ($f in $segFiles) { Remove-Item -Force $f -ErrorAction SilentlyContinue }
         return $false
     }
 }
 
-# ======== 下载（带进度 + 重试 + 校验 + 分片 + BITS + curl） ========
+# ======== 查找 pwsh（PATH + 常见安装路径） ========
+function Find-PwshPath {
+    $e = Get-Command 'pwsh' -ErrorAction SilentlyContinue
+    if ($e) { $script:PwshPath = $e.Source; $script:HasPwsh = $true; return $true }
+    $paths = @(
+        "$env:ProgramFiles\PowerShell\7\pwsh.exe",
+        "$env:ProgramFiles\PowerShell\7-preview\pwsh.exe",
+        "$env:LOCALAPPDATA\Microsoft\WindowsApps\pwsh.exe"
+    )
+    foreach ($p in $paths) {
+        if (Test-Path $p) { $script:PwshPath = $p; $script:HasPwsh = $true; return $true }
+    }
+    return $false
+}
+
+# ======== pwsh 自动安装 ========
+function Ensure-Pwsh {
+    if (Find-PwshPath) { return $true }
+    $localPwsh = Join-Path $PwshDir 'pwsh.exe'
+    if (Test-Path $localPwsh) { $script:PwshPath = $localPwsh; $script:HasPwsh = $true; return $true }
+    # 本地安装包检测（用户放到 MAA 目录中的 PowerShell 安装包 .exe / .msi / .zip）
+    $localInstaller = Get-ChildItem "$ScriptDir\*" -Include 'PowerShell*.exe', 'PowerShell*.msi', 'PowerShell*.zip' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($localInstaller) {
+        $inst = $localInstaller.FullName
+        Write-Info "发现本地安装包: $($localInstaller.Name)"
+        if ($inst -match '\.msi$') {
+            $p = Start-Process msiexec.exe -ArgumentList "/package `"$inst`" /quiet ADD_PATH=1" -Wait -PassThru -NoNewWindow
+            if ($p.ExitCode -eq 0 -and (Find-PwshPath)) { Remove-Item -Force $inst; Write-Ok 'PowerShell 7 安装成功'; return $true }
+        } elseif ($inst -match '\.zip$') {
+            New-Directory $PwshDir; Expand-Zip $inst $PwshDir
+            if (Test-Path $localPwsh) { $script:PwshPath = $localPwsh; $script:HasPwsh = $true; Remove-Item -Force $inst; Write-Ok 'PowerShell 便携版就绪'; return $true }
+        } elseif ($inst -match '\.exe$') {
+            if ($script:IsAdmin) {
+                $p = Start-Process $inst -ArgumentList '/quiet', 'ADD_PATH=1' -Wait -PassThru -NoNewWindow
+            } else {
+                $p = Start-Process $inst -Wait -PassThru -NoNewWindow
+            }
+            if ($p.ExitCode -eq 0 -and (Find-PwshPath)) { Remove-Item -Force $inst; Write-Ok 'PowerShell 7 安装成功'; return $true }
+        }
+        Write-Warn "本地安装包处理失败，尝试网络下载..."
+    }
+    Write-Info 'PowerShell 7 未安装，尝试网络下载...'
+    $pwshVer = '7.6.2'
+    # 1) winget 全局安装（直连 GitHub，速度最快，优先尝试）
+    $wg = Get-Command 'winget' -ErrorAction SilentlyContinue
+    if ($wg) {
+        Write-Info '使用 winget 安装 PowerShell（正在下载，请耐心等待）...'
+        $p = Start-Process winget -ArgumentList 'install', '--id', 'Microsoft.PowerShell', '--source', 'winget', '--installer-type', 'wix', '--silent', '--accept-package-agreements' -NoNewWindow -PassThru
+        $done = $p.WaitForExit(300000)
+        if (-not $done) { $p.Kill(); Write-Warn 'winget 超时' }
+        else { Start-Sleep 2; if (Find-PwshPath) { return $true } }
+    }
+    # 也检查系统是否已经装了 pwsh（PATH 未刷新时兜底）
+    if (Find-PwshPath) { return $true }
+    # 2) MSI 镜像下载 + 静默安装（需管理员）
+    if ($script:IsAdmin) {
+        $msiUrl = "https://github.com/PowerShell/PowerShell/releases/download/v$pwshVer/PowerShell-$pwshVer-win-x64.msi"
+        $msiUrls = @(
+            "https://gh-proxy.com/$msiUrl",
+            "https://ghproxy.net/$msiUrl",
+            $msiUrl
+        )
+        $msiFile = Join-Path $TempDir "PowerShell-$pwshVer-win-x64.msi"
+        foreach ($u in $msiUrls) {
+            if (Start-Download -Url $u -OutFile $msiFile -DisplayName "PowerShell $pwshVer MSI") { break }
+        }
+        if ((Test-Path $msiFile) -and ((Get-Item $msiFile).Length -gt 1MB)) {
+            Write-Info '正在静默安装 PowerShell 7...'
+            $p = Start-Process msiexec.exe -ArgumentList "/package `"$msiFile`" /quiet ADD_PATH=1" -Wait -PassThru -NoNewWindow
+            Remove-Item -Force $msiFile -ErrorAction SilentlyContinue
+            if ($p.ExitCode -eq 0) {
+                $e = Get-Command 'pwsh' -ErrorAction SilentlyContinue
+                if ($e) { $script:PwshPath = $e.Source; $script:HasPwsh = $true; Write-Ok 'PowerShell 7 安装成功'; return $true }
+            }
+            Write-Warn 'MSI 静默安装失败，尝试其他方式...'
+        }
+    }
+    # 3) ZIP 便携版（无需管理员，走镜像，去 speed-limit 避免慢速误杀）
+    $pwshZip = Join-Path $TempDir "PowerShell-$pwshVer-win-x64.zip"
+    $pwshUrl = "https://github.com/PowerShell/PowerShell/releases/download/v$pwshVer/PowerShell-$pwshVer-win-x64.zip"
+    $zipUrls = @("https://gh-proxy.com/$pwshUrl", "https://ghproxy.net/$pwshUrl", $pwshUrl)
+    $zipOk = $false
+    foreach ($u in $zipUrls) {
+        $tmp = Join-Path $TempDir "pwsh_tmp.zip"
+        try {
+            Show-Wait "正在下载 PowerShell $pwshVer ZIP..."
+            if ($script:HasCurl) {
+                & curl.exe -L -f -o $tmp --connect-timeout 15 --max-time 600 -s $u 2>$null
+                if ($LASTEXITCODE -eq 0 -and (Test-Path $tmp) -and ((Get-Item $tmp).Length -gt 1MB)) { Move-Item -Force $tmp $pwshZip; $zipOk = $true; break }
+            }
+        } catch { continue }
+        finally { if (Test-Path $tmp) { Remove-Item -Force $tmp -ErrorAction SilentlyContinue } }
+    }
+    if ($zipOk -and (Test-Path $pwshZip)) {
+        New-Directory $PwshDir
+        Expand-Zip $pwshZip $PwshDir
+        Remove-Item -Force $pwshZip -ErrorAction SilentlyContinue
+        if (Test-Path $localPwsh) { $script:PwshPath = $localPwsh; $script:HasPwsh = $true; Write-Ok 'PowerShell 便携版就绪'; return $true }
+    }
+    Write-Warn '所有下载方式均失败。可手动从微软商店安装 PowerShell 7：'
+    Write-Warn 'https://apps.microsoft.com/detail/9mz1snwt0n5d?hl=zh-CN&gl=CN'
+    return $false
+}
+
+# ======== HTTP/2 下载（pwsh + .NET SocketsHttpHandler） ========
+function Start-Http2Download {
+    param([string]$Url, [string]$OutFile, [string]$DisplayName, [long]$ExpectedSize = 0)
+    if (-not $script:HasPwsh) { return $false }
+    try {
+        Write-Info "尝试 HTTP/2 下载 (pwsh)..."
+        New-Directory $TempDir
+        New-Directory (Split-Path $OutFile -Parent)
+        $ps1 = Join-Path $TempDir 'http2_dl.ps1'
+        @"
+param(`$u, `$o)
+try {
+    `$h = [System.Net.Http.SocketsHttpHandler]::new()
+    `$h.EnableMultipleHttp2Connections = `$true
+    `$c = [System.Net.Http.HttpClient]::new(`$h)
+    `$c.DefaultRequestHeaders.UserAgent.ParseAdd('MAA-Update/2.0')
+    `$c.Timeout = [TimeSpan]::FromSeconds(600)
+    `$r = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, `$u)
+    `$r.Version = [System.Net.HttpVersion]::Version20
+    `$resp = `$c.SendAsync(`$r, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+    if (-not `$resp.IsSuccessStatusCode) { exit 1 }
+    `$s = `$resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+    `$f = [System.IO.File]::Create(`$o)
+    `$s.CopyToAsync(`$f).GetAwaiter().GetResult()
+    `$f.Close()
+    exit 0
+} catch { exit 2 }
+"@ | Set-Content $ps1 -Encoding UTF8
+        & $script:PwshPath -NoProfile -File $ps1 $Url $OutFile
+        Remove-Item -Force $ps1 -ErrorAction SilentlyContinue
+        if ($LASTEXITCODE -eq 0 -and (Test-Path $OutFile)) {
+            $actualSize = (Get-Item $OutFile).Length
+            if ($ExpectedSize -le 0 -or $actualSize -eq $ExpectedSize) {
+                Write-Ok "$DisplayName 下载完成 (HTTP/2, $(Format-FileSize $actualSize))"
+                return $true
+            }
+            Write-Warn "HTTP/2 大小不匹配"; Remove-Item -Force $OutFile -ErrorAction SilentlyContinue
+        } else { Write-Warn "HTTP/2 退出($LASTEXITCODE)" }
+    } catch { Write-Warn "HTTP/2 下载失败: $_" }
+    return $false
+}
+
+# ======== 下载（带进度 + 重试 + 校验 + 分片 + BITS + HTTP/2 + curl） ========
 function Start-Download {
     param([string]$Url, [string]$OutFile, [string]$DisplayName, [long]$ExpectedSize = 0)
+
+    # 0. pwsh HTTP/2 下载（SocketsHttpHandler，适合受限网络）
+    if (Start-Http2Download -Url $Url -OutFile $OutFile -DisplayName $DisplayName -ExpectedSize $ExpectedSize) {
+        return $true
+    }
 
     # 1. curl.exe（TCP 栈优于 .NET，优先）
     if ($script:HasCurl) {
@@ -288,7 +463,8 @@ function Start-Download {
             if ($try -gt 1) { Write-Warn "curl 重试第 $try 次..." }
             try {
                 Write-Info "尝试 curl 下载..."
-                & curl.exe -L -f -o $OutFile --connect-timeout 15 --max-time 60 --speed-limit 10K --speed-time 15 $script:CurlResolve $Url
+                New-Directory (Split-Path $OutFile -Parent)
+                & curl.exe -L -f -o $OutFile --connect-timeout 5 --max-time 600 --speed-limit 10240 --speed-time 15 $script:CurlResolve $Url
                 if ($LASTEXITCODE -eq 0 -and (Test-Path $OutFile)) {
                     $actualSize = (Get-Item $OutFile).Length
                     if ($ExpectedSize -le 0 -or $actualSize -eq $ExpectedSize) {
@@ -296,10 +472,12 @@ function Start-Download {
                         return $true
                     }
                     Write-Warn "curl 大小不匹配"; Remove-Item -Force $OutFile -ErrorAction SilentlyContinue
-                } elseif ($LASTEXITCODE -ne 0) {
+                }
+                elseif ($LASTEXITCODE -ne 0) {
                     Write-Warn "curl 退出($LASTEXITCODE)，等待重试..."
                 }
-            } catch { Write-Warn "curl 下载失败: $_"; Remove-Item -Force $OutFile -ErrorAction SilentlyContinue }
+            }
+            catch { Write-Warn "curl 下载失败: $_"; Remove-Item -Force $OutFile -ErrorAction SilentlyContinue }
         }
     }
 
@@ -338,30 +516,15 @@ function Start-Download {
             }
             Write-Ok "$DisplayName 下载完成 ($(Format-FileSize $actualSize))"
             return $true
-        } catch {
+        }
+        catch {
             Write-Warn "下载失败: $_"
             Remove-Item -Force $OutFile -ErrorAction SilentlyContinue
         }
     }
     Write-Progress -Activity "下载 $DisplayName" -Completed
 
-    # 4. BITS 后备（断点续传）
-    try {
-        $bits = Get-Service -Name 'BITS' -ErrorAction SilentlyContinue
-        if ($bits -and $bits.Status -eq 'Running') {
-            Write-Info "尝试 BITS 下载...正在下载不要关闭程序"
-            New-Directory (Split-Path $OutFile -Parent)
-            Start-BitsTransfer -Source $Url -Destination $OutFile -Priority High -ErrorAction Stop
-            $actualSize = (Get-Item $OutFile).Length
-            if ($ExpectedSize -le 0 -or $actualSize -eq $ExpectedSize) {
-                Write-Ok "$DisplayName 下载完成 (BITS)"
-                return $true
-            }
-            Write-Warn "BITS 大小不匹配"; Remove-Item -Force $OutFile -ErrorAction SilentlyContinue
-        }
-    } catch { Write-Warn "BITS 下载失败: $_"; Remove-Item -Force $OutFile -ErrorAction SilentlyContinue }
-
-    Write-Err "$DisplayName 下载失败（curl/分片/HTTP/BITS 均不可用）"
+    Write-Err "$DisplayName 下载失败（curl/分片/HTTP 均不可用）"
     return $false
 }
 
@@ -378,7 +541,8 @@ function Get-CurrentVersion {
                     Write-Info "当前版本 (MAA.exe): $v"; return $v
                 }
             }
-        } catch {}
+        }
+        catch {}
     }
     # 2: MaaCore.dll
     $dllPath = Join-Path $ScriptDir 'MaaCore.dll'
@@ -391,7 +555,8 @@ function Get-CurrentVersion {
                     Write-Info "当前版本 (MaaCore.dll): $v"; return $v
                 }
             }
-        } catch {}
+        }
+        catch {}
     }
     # 3: gui.json
     $cfgPath = Join-Path $ScriptDir 'config/gui.json'
@@ -399,7 +564,8 @@ function Get-CurrentVersion {
         try {
             $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
             if ($cfg.VersionUpdate.name) { Write-Info "当前版本 (gui.json): $($cfg.VersionUpdate.name)"; return $cfg.VersionUpdate.name }
-        } catch {}
+        }
+        catch {}
     }
     Write-Warn '无法检测当前版本，使用 0.0.0'
     return 'v0.0.0'
@@ -439,7 +605,8 @@ function Read-ResVersionCache {
         $cache = Get-Content $ResCacheFile -Raw -Encoding UTF8 | ConvertFrom-Json
         $age = [DateTime]::Now - [DateTime]::ParseExact($cache.cached_at, 'yyyy-MM-dd HH:mm:ss', $null)
         if ($age.TotalHours -le 24) { return $cache }
-    } catch {}
+    }
+    catch {}
     return $null
 }
 function Write-ResVersionCache {
@@ -463,7 +630,8 @@ function Check-VersionUpdate {
                 $detected = $channelMap["$savedChannel"]
                 if ($detected) { $Channel = $detected; Write-Info "从配置读取更新通道: $Channel" }
             }
-        } catch {}
+        }
+        catch {}
     }
     Write-Info "更新通道: $Channel"
 
@@ -572,7 +740,8 @@ function Install-Update {
     try {
         Show-Wait '正在解压更新包...'
         Expand-Zip -ZipPath $PackagePath -DestDir $extractDir
-    } catch { Write-Err "解压失败: $_"; return $false }
+    }
+    catch { Write-Err "解压失败: $_"; return $false }
 
     # 检测根目录
     $entries = Get-ChildItem $extractDir
@@ -613,9 +782,11 @@ function Install-Update {
                         $f = $f.Trim()
                         if (-not $f -or $f.EndsWith('\') -or $f.EndsWith('/')) { continue }
                         $removeFiles.Add($f); $affectedFiles.Add($f)
-    } catch { Write-Warn "DNS 加速失败: $_" }
-}
-            } catch { Write-Warn 'changes.json 解析失败，跳过' }
+                    }
+                    catch { Write-Warn "DNS 加速失败: $_" }
+                }
+            }
+            catch { Write-Warn 'changes.json 解析失败，跳过' }
         }
         # 新增文件列表
         $controlFiles = @('removelist.txt', 'changes.json')
@@ -656,7 +827,8 @@ function Install-Update {
             New-Directory (Split-Path $dest -Parent)
             try { Copy-Item $file.FullName $dest -Force } catch { Write-Warn "跳过复制: $rel" }
         }
-    } else {
+    }
+    else {
         # ===== 完整包 =====
         Write-Info '完整更新包'
         Set-State -Phase 'full_install' -Version $UpdateInfo.Version
@@ -719,7 +891,8 @@ function Update-Resource {
         try {
             $localJson = Get-Content $localVerPath -Raw -Encoding UTF8 | ConvertFrom-Json
             $localTime = [DateTime]::ParseExact($localJson.last_updated, 'yyyy-MM-dd HH:mm:ss.fff', $null)
-        } catch {}
+        }
+        catch {}
     }
     Write-Info "本地资源时间: $($localTime.ToString('yyyy-MM-dd HH:mm:ss'))"
 
@@ -731,7 +904,8 @@ function Update-Resource {
             $remoteJson = Invoke-GetJson $ResourceVersionUrl -TimeoutSec 10
             if ($remoteJson -and $remoteJson.last_updated) { Write-ResVersionCache $remoteJson.last_updated; break }
         }
-    } else { Write-Info '使用缓存的资源版本' }
+    }
+    else { Write-Info '使用缓存的资源版本' }
     if (-not $remoteJson -or -not $remoteJson.last_updated) {
         Write-Warn '无法获取远程资源版本，跳过资源更新'
         return $false
@@ -744,20 +918,17 @@ function Update-Resource {
     Write-Info "发现新资源 ($($remoteJson.last_updated))"
     if ($DryRun) { Write-Warn '仅检查模式，跳过资源下载'; return $null }
 
+    # 资源包下载 - 多源重试（HTTP/2 优先 → curl → 分段 → BITS）
     $resZip = Join-Path $TempDir 'MaaResource.zip'
-
-    # 资源包下载 - 优先直连（DNS 加速后可能有快 IP），镜像兜底
+    $dlOk = $false
     $resUrls = @(
         $ResourceArchiveUrl,
+        "https://gh-proxy.com/$ResourceArchiveUrl",
         "https://ghproxy.net/$ResourceArchiveUrl"
     )
-    $dlOk = $false
+    if (-not $script:HasPwsh) { Write-Info 'pwsh 不可用，HTTP/2 下载将被跳过' }
     foreach ($rurl in $resUrls) {
-        for ($i = 1; $i -le $MaxRetries; $i++) {
-            if ($i -gt 1) { Write-Info "资源下载重试第 $i 次..." }
-            if (Start-Download -Url $rurl -OutFile $resZip -DisplayName '游戏资源包') { $dlOk = $true; break }
-        }
-        if ($dlOk) { break }
+        if (Start-Download -Url $rurl -OutFile $resZip -DisplayName '游戏资源包') { $dlOk = $true; break }
         Write-Warn "资源下载源不可用: $rurl"
     }
     if (-not $dlOk) { Write-Err '资源下载失败'; return $false }
@@ -768,7 +939,8 @@ function Update-Resource {
     try {
         Show-Wait '正在解压资源包...'
         Expand-Zip -ZipPath $resZip -DestDir $resExtract
-    } catch { Write-Err "解压失败: $_"; return $false }
+    }
+    catch { Write-Err "解压失败: $_"; return $false }
 
     $resSource = Join-Path $resExtract 'MaaResource-main/resource'
     if (-not (Test-Path $resSource)) { $resSource = Join-Path $resExtract 'resource' }
@@ -810,7 +982,8 @@ try {
             Write-Warn "检测到上次未完成的更新 (阶段: $($state.Phase), 版本: $($state.Version))"
             # 尝试回滚
             if (Test-Path $BackupDir) { Restore-Backup }
-        } catch {}
+        }
+        catch {}
         Clear-State
     }
 
@@ -820,6 +993,9 @@ try {
 
     # DNS 加速（解析 + 测速 + hosts/curl-resolve）
     Initialize-DnsAccel
+
+    # 确保 pwsh 可用（HTTP/2 下载）
+    Ensure-Pwsh | Out-Null
 
     $script:CurrentVersion = Get-CurrentVersion
 
@@ -849,12 +1025,14 @@ try {
                     Write-ResVersionCache $remoteRj.last_updated; break
                 }
             }
-        } else { Write-Info '使用缓存的资源版本' }
+        }
+        else { Write-Info '使用缓存的资源版本' }
         if ($remoteRj -and $remoteRj.last_updated) {
             $remoteRt = [DateTime]::ParseExact($remoteRj.last_updated, 'yyyy-MM-dd HH:mm:ss.fff', $null)
             if ($remoteRt -gt $localRt -or $Force) { $needResourceUpdate = $true }
             else { Write-Ok '资源已是最新' }
         }
+        else { Write-Warn '无法获取远程资源版本，跳过资源更新（可按上方说明手动安装 PowerShell 7 后重试）' }
     }
 
     # === 判断是否需要更新 ===
@@ -906,7 +1084,8 @@ try {
         Write-Ok 'MAA 已重新启动'
     }
 
-} catch {
+}
+catch {
     Write-Err "更新过程出错: $_"
     Write-Err $_.ScriptStackTrace
     Write-Log 'ERROR' "异常: $_"

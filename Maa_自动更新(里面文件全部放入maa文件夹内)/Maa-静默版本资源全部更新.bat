@@ -1,4 +1,3 @@
 @echo off
-chcp 65001 >nul
-title MAA Update
+title MAA Update - 全部
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Maa-Update.ps1" %*

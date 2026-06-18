@@ -1,0 +1,109 @@
+MAA 自动更新脚本 - 使用说明
+=============================
+
+【文件说明】
+把本文件夹内的所有文件，复制到 MAA 程序所在文件夹（和 MAA.exe 同目录）。
+以下 .bat 文件直接双击运行：
+
+  Maa-静默版本资源全部更新.bat  — 更新 MAA 版本 + 游戏资源（完整更新）用于自动化执行
+                                   静默模式，更新完自动退出
+  Maa-静默更新版本.bat          — 只更新 MAA 版本，跳过游戏资源 当资源更新失败使用这个,在MAA内更新资源
+                                   静默模式，更新完自动退出
+  Maa-Debug-Update.bat           — 完整更新，但执行完后暂停并保留窗口
+                                   用于查看详细输出、保存日志、反馈问题
+
+【首次运行】
+ -------------------------->将(Maa_自动更新(里面文件全部放入maa文件夹内))下所有文件放入 MAA安装目录<--------------------------------
+  
+  脚本会自动检测并安装 PowerShell 7（用于 HTTP/2 下载）。
+  如果遇到网络问题无法自动下载，按以下顺序尝试：
+  1. 从微软商店安装（国内可正常访问）：
+     https://apps.microsoft.com/detail/9mz1snwt0n5d?hl=zh-CN&gl=CN
+  2. 手动下载安装包放到 MAA 文件夹：
+     a. 打开 https://github.com/PowerShell/PowerShell/releases
+     b. 下载 PowerShell-7.6.2-win-x64.msi 或 .zip
+     c. 放到 MAA 程序文件夹，脚本会自动识别安装
+     
+【Maa-Debug-Update.bat 怎么用】
+  1. 双击运行，脚本执行完后窗口不会自动关闭
+  2. 右键点击窗口标题栏 → 编辑 → 全选 → 复制
+  3. 将内容粘贴到反馈中（或保存到文件）
+  Debug 模式不修改任何更新逻辑，只是保留输出窗口方便排查。
+
+【如何保存完整日志】
+  方法一（推荐）：使用 Maa-Debug-Update.bat，复制窗口内容
+  方法二：在 MAA 文件夹打开 cmd（地址栏输入 cmd 回车），执行：
+    powershell -NoProfile -ExecutionPolicy Bypass -File "Maa-Update.ps1" > update_log.txt 2>&1
+  生成的 update_log.txt 就是完整日志，可发送给开发者分析。
+
+【如何自动化运行】
+  [1]使用maa程序的启动前运行功能
+  
+  1.打开maa,切换到设置
+  2.选择运行设置,选择(Maa-静默版本资源全部更新.bat)拖入开始前脚本
+  3.或者自己输入完整路径,修改安装文件夹需重新设置
+  
+  [2]使用 Windows 任务计划程序设置定时自动更新：
+
+  1. 按 Win+R，输入 taskschd.msc 回车
+  2. 右侧"创建基本任务"
+  3. 名称填 "MAA 自动更新"，触发器选每天（或每周）
+  4. 操作选"启动程序"，程序填 powershell
+  5. 参数填：
+     -NoProfile -ExecutionPolicy Bypass -File "C:\你的MAA路径\Maa-Update.ps1"
+  6. 如需只更新版本（不更新资源），在参数末尾加 -SkipResource
+  7. 完成
+
+  注意：任务计划程序默认不显示窗口，如果出问题先用 Maa-Debug-Update.bat 测试。
+
+【运行要求】
+  * 系统：Windows 10/11
+  * 网络：中国普通宽带/移动网络（已针对国内网络优化）
+  * 权限：管理员权限可自动安装 PowerShell 7（无管理员则用便携版）
+
+【更新逻辑】
+  版本更新：
+    优先使用 OTA 增量包（只下载差异，体积小）
+    如果 OTA 找不到，回退到完整安装包
+
+  资源更新：
+    使用 PowerShell 7 + HTTP/2 下载（国内网络必须）
+    如果 HTTP/2 失败，尝试多源镜像+多策略兜底
+
+  安装流程：
+    先下载更新包（MAA 仍在运行，不影响使用）
+    下载完成 → 自动关闭 MAA → 备份旧文件 → 安装 → 重新启动 MAA
+
+【更新中途关闭/断电】
+  脚本有状态恢复机制（.update_state 文件），重新运行会从断点继续。
+  如果恢复失败，删除 MAA 目录下的 .update_state 和 .update_temp 即可从头开始。
+
+【常见问题】
+  Q: 双击 .bat 闪一下就消失？
+  A: 先用 Maa-Debug-Update.bat，窗口会保留并显示错误原因。
+     常见原因：文件没放到 MAA.exe 同目录、路径含空格、权限不足。
+
+  Q: 提示 "PowerShell 下载失败" 但后续能更新？
+  A: 版本更新走 curl 直连，不需要 pwsh。只有资源更新才需要 pwsh HTTP/2。
+     可从微软商店安装（国内可访问）：
+     https://apps.microsoft.com/detail/9mz1snwt0n5d?hl=zh-CN&gl=CN
+     或手动下载安装包放到 MAA 文件夹（见上方说明）。
+
+  Q: 下载很慢/超时？
+  A: 脚本内置多镜像多策略重试（直连 → ghproxy.net → gh-proxy.com），
+     一般会自动成功。如果总失败，检查网络、重置 hosts 文件或挂梯子。
+
+  Q: 更新后 MAA 启动异常？
+  A: 脚本自动保留备份在 .update_backup 文件夹。
+     手动把该文件夹内容覆盖回 MAA 目录即可回滚。
+
+  Q: 什么是 OTA 增量更新？
+  A: 只下载和旧版本有差异的文件，通常只有几 MB 到十几 MB，
+     比下载完整包（几百 MB）快得多。
+
+  Q: 如何给开发者反馈问题？
+  A: 运行 Maa-Debug-Update.bat，复制完整窗口内容提交。
+     日志文件位置：MAA 目录下的 update.log。
+     状态文件：.update_state（可删除重置）。
+     作者邮箱:1690594875@qq.com
+     QQ:同上
