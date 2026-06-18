@@ -4,6 +4,8 @@
 .DESCRIPTION
     放置于 MAA 安装目录下直接运行。
     具备下载重试、镜像降级、安装前备份、失败回滚、日志记录、API 缓存等冗余机制。
+.AUTHOR
+    bigbee
 #>
 
 param(

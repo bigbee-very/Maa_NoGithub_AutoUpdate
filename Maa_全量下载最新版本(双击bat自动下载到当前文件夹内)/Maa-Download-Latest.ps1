@@ -4,6 +4,8 @@
 .DESCRIPTION
     从 api.maa.plus 获取最新版本信息，通过镜像/直链下载到当前目录。
     具备主备 API、镜像降级、下载重试、文件校验等冗余机制。
+.AUTHOR
+    bigbee
 #>
 
 param(
@@ -30,11 +32,11 @@ $RetryMax = 3
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
-function Write-Step  { Write-Host "`n>>> $($args[0])" -ForegroundColor Magenta }
-function Write-Info  { Write-Host "[信息] $($args[0])" -ForegroundColor Cyan }
-function Write-Ok    { Write-Host "[成功] $($args[0])" -ForegroundColor Green }
-function Write-Warn  { Write-Host "[注意] $($args[0])" -ForegroundColor Yellow }
-function Write-Err   { Write-Host "[错误] $($args[0])" -ForegroundColor Red }
+function Write-Step { Write-Host "`n>>> $($args[0])" -ForegroundColor Magenta }
+function Write-Info { Write-Host "[信息] $($args[0])" -ForegroundColor Cyan }
+function Write-Ok { Write-Host "[成功] $($args[0])" -ForegroundColor Green }
+function Write-Warn { Write-Host "[注意] $($args[0])" -ForegroundColor Yellow }
+function Write-Err { Write-Host "[错误] $($args[0])" -ForegroundColor Red }
 
 function Format-FileSize {
     param([long]$Bytes)
@@ -65,7 +67,8 @@ function Start-Download {
                 if ($LASTEXITCODE -ne 0) {
                     throw "curl 返回退出码 $LASTEXITCODE : $result"
                 }
-            } else {
+            }
+            else {
                 Write-Info "使用 WebClient 下载..."
                 $wc = New-Object System.Net.WebClient
                 $wc.Headers.Add('User-Agent', 'MAA-DL/1.0')
