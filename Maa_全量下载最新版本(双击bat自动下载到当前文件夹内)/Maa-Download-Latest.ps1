@@ -6,6 +6,8 @@
     具备主备 API、镜像降级、下载重试、文件校验等冗余机制。
 .AUTHOR
     bigbee
+.PROJECT
+    https://github.com/bigbee-very/Maa_NoGithub_AutoUpdate#maa-nogithub-autoupdate
 #>
 
 param(
