@@ -235,12 +235,13 @@ function Start-SegmentedDownload {
     }
     catch { return $false }
 
+    $segFiles = @()
     try {
         Write-Info "启用分片下载 ($Segments 片, 共 $(Format-FileSize $totalLen))"
         New-Directory (Split-Path $OutFile -Parent)
 
         $segSize = [Math]::Ceiling($totalLen / $Segments)
-        $segFiles = @(); $segTasks = @()
+        $segFiles = @(); $segTasks = @(); $psInstances = @()
         $pool = [RunspaceFactory]::CreateRunspacePool(1, $Segments)
         $pool.Open()
 
@@ -263,6 +264,7 @@ function Start-SegmentedDownload {
                     while (($rd = $s.Read($buf, 0, $buf.Length)) -gt 0) { $fs.Write($buf, 0, $rd) }
                     $fs.Close(); $s.Close()
                 }).AddParameters(@{u = $Url; f = $from; t = $to; o = $segFile })
+            $psInstances += $ps
             $segTasks += $ps.BeginInvoke()
         }
 
@@ -270,10 +272,11 @@ function Start-SegmentedDownload {
         for ($i = 0; $i -lt $Segments; $i++) {
             try {
                 $segTasks[$i].AsyncWaitHandle.WaitOne() | Out-Null
-                $segTasks[$i] = $ps.EndInvoke($segTasks[$i])
+                $null = $psInstances[$i].EndInvoke($segTasks[$i])
             } catch { $failed = $true; Write-Warn "分片 $i 下载失败: $_" }
         }
         $pool.Close(); $pool.Dispose()
+        foreach ($psInstance in $psInstances) { $psInstance.Dispose() }
 
         if ($failed) { throw '分片下载失败' }
 
@@ -647,7 +650,7 @@ function Check-VersionUpdate {
 
     # 优先 OTA，兜底完整包
     $otaAsset = $null; $fullAsset = $null
-    $currentVer = $script:CurrentVersion.TrimStart('v')
+    $currentVer = $script:CurrentVersion
     foreach ($a in $assets) {
         $name = [string]$a.name
         if (-not $name.Contains('win')) { continue }
@@ -758,7 +761,6 @@ function Install-Update {
                         if (-not $f -or $f.EndsWith('\') -or $f.EndsWith('/')) { continue }
                         $removeFiles.Add($f); $affectedFiles.Add($f)
                     }
-                    catch { Write-Warn "DNS 加速失败: $_" }
                 }
             }
             catch { Write-Warn 'changes.json 解析失败，跳过' }
