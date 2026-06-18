@@ -6,7 +6,7 @@
 
 通过网盘分享的文件：Maa_NoGithub_Update.zip
 
-链接: https://pan.baidu.com/s/1s4JVswcoIS6lAPUKvk1lHw?pwd=1234 提取码: 1234
+链接: https://pan.baidu.com/s/1EhcMHdyUzN_iFOwh8Qs3aQ?pwd=1234 提取码: 1234
 
 ## 目录结构
 
