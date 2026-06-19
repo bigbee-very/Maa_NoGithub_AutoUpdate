@@ -1,6 +1,6 @@
 ﻿<#:
 .SYNOPSIS
-    MAA 一键更新脚本 — 无代理 v2.2（带故障冗余）
+    MAA 一键更新脚本 — 无代理 v2.3（带故障冗余）
 .DESCRIPTION
     放置于 MAA 安装目录下直接运行。
     具备下载重试、镜像降级、安装前备份、失败回滚、日志记录、API 缓存等冗余机制。
@@ -85,8 +85,8 @@ function Initialize-DnsAccel {
                 if ($script:HasCurl) { $script:CurlResolve += "--resolve", "$dom`:443`:$bestIp", "--resolve", "$dom`:80`:$bestIp" }
                 if ($script:IsAdmin) {
                     $content = Get-Content $script:HostsPath -Raw -ErrorAction SilentlyContinue
-                    if ($content) { $content = $content -replace "(?m)^\d+\.\d+\.\d+\.\d+\s+$dom\s+$HostsMarker\s*`n", '' }
-                    "$bestIp $dom $HostsMarker" | Out-File $script:HostsPath -Append -Encoding ASCII
+                    if ($content) { $content = $content -replace "(?m)^\d+\.\d+\.\d+\.\d+\s+$dom\s*`n", '' }
+                    "$bestIp $dom $script:HostsMarker" | Out-File $script:HostsPath -Append -Encoding ASCII
                 }
             }
         }
@@ -97,7 +97,10 @@ function Cleanup-DnsAccel {
     if ($script:IsAdmin -and (Test-Path $script:HostsPath)) {
         $content = Get-Content $script:HostsPath -Raw -ErrorAction SilentlyContinue
         if ($content) {
-            $content = $content -replace "(?m)^.*$HostsMarker\s*`n", ''
+            foreach ($dom in $SlowDomains) {
+                $content = $content -replace "(?m)^\d+\.\d+\.\d+\.\d+\s+$dom\s*`n", ''
+            }
+            $content = $content -replace "(?m)^.*$([Regex]::Escape($script:HostsMarker))\s*`n", ''
             Set-Content $script:HostsPath -Value $content -Encoding ASCII
         }
     }
@@ -365,22 +368,9 @@ function Ensure-Pwsh {
         else { Start-Sleep 2; if (Find-PwshPath) { New-Item -Force $PwshMarkerFile | Out-Null; return $true } }
     }
     if (Find-PwshPath) { New-Item -Force $PwshMarkerFile | Out-Null; return $true }
-    if ($script:IsAdmin) {
-        $msiUrl = "https://github.com/PowerShell/PowerShell/releases/download/v$pwshVer/PowerShell-$pwshVer-win-x64.msi"
-        $msiFile = Join-Path $TempDir "PowerShell-$pwshVer-win-x64.msi"
-        foreach ($u in @("https://gh-proxy.com/$msiUrl", "https://ghproxy.net/$msiUrl", $msiUrl)) {
-            if (Start-Download -Url $u -OutFile $msiFile -DisplayName "PowerShell $pwshVer MSI") { break }
-        }
-        if ((Test-Path $msiFile) -and ((Get-Item $msiFile).Length -gt 1MB)) {
-            Write-Info '正在静默安装 PowerShell 7...'
-            $p = Start-Process msiexec.exe -ArgumentList "/package `"$msiFile`" /quiet ADD_PATH=1" -Wait -PassThru -NoNewWindow
-            Remove-Item -Force $msiFile -ErrorAction SilentlyContinue
-            if ($p.ExitCode -eq 0 -and (Find-PwshPath)) { New-Item -Force $PwshMarkerFile | Out-Null; return $true }
-        }
-    }
     # 创建标记，下次不再自动下载
     New-Item -Force $PwshMarkerFile | Out-Null
-    Write-Warn 'PowerShell 7 自动安装失败。请从微软商店安装：'
+    Write-Warn 'PowerShell 7 自动安装失败。尝试从微软商店安装：'
     Write-Warn 'https://apps.microsoft.com/detail/9mz1snwt0n5d?hl=zh-CN&gl=CN'
     return $false
 }
@@ -699,6 +689,16 @@ function Download-UpdatePackage {
         Set-State -Phase 'downloading' -Version $UpdateInfo.Version -Detail $filename
         
         if (Start-Download -Url $url -OutFile $filepath -DisplayName $filename -ExpectedSize $expectedSize) {
+            if ($asset.sha256) {
+                Write-Info '验证 SHA256...'
+                $hash = Get-FileHash $filepath -Algorithm SHA256
+                if ($hash.Hash -ne $asset.sha256) {
+                    Write-Err 'SHA256 校验失败，文件可能损坏'
+                    Remove-Item -Force $filepath -ErrorAction SilentlyContinue
+                    continue
+                }
+                Write-Ok 'SHA256 校验通过'
+            }
             return $filepath
         }
     }
@@ -815,9 +815,22 @@ function Install-Update {
             $src = Join-Path $ScriptDir $d
             if (Test-Path $src) { Copy-Item -Recurse $src (Join-Path $BackupDir $d) -Force }
         }
-        # 复制新文件（跳过保留目录中的控制文件）
+        # 备份所有将被覆盖的文件（完整包更新无 OTA 差异清单，全量保护）
         $controlFiles = @('removelist.txt', 'changes.json')
-        Get-ChildItem $sourceDir -File -Recurse | ForEach-Object {
+        $overwriteFiles = Get-ChildItem $sourceDir -File -Recurse
+        $overwriteFiles | ForEach-Object {
+            $rel = $_.FullName.Substring($sourceDir.Length + 1)
+            $topDir = ($rel -split '[\\/]')[0]
+            if ($topDir -in $PreserveDirs -or $rel -in $controlFiles) { return }
+            $src = Join-Path $ScriptDir $rel
+            if (Test-Path $src) {
+                $backupDest = Join-Path $BackupDir $rel
+                New-Directory (Split-Path $backupDest -Parent)
+                Copy-Item $src $backupDest -Force
+            }
+        }
+        # 复制新文件（跳过保留目录中的控制文件）
+        $overwriteFiles | ForEach-Object {
             $rel = $_.FullName.Substring($sourceDir.Length + 1)
             $topDir = ($rel -split '[\\/]')[0]
             if ($topDir -in $PreserveDirs -or $rel -in $controlFiles) { return }
@@ -951,7 +964,7 @@ function Cleanup-Temp {
 try {
     # 清旧日志，写新日志
     if (Test-Path $LogFile) { Remove-Item -Force $LogFile -ErrorAction SilentlyContinue }
-    Write-Log 'INFO' "=== MAA 更新脚本 v2.2 启动 ==="
+    Write-Log 'INFO' "=== MAA 更新脚本 v2.3 启动 ==="
     Write-Log 'INFO' "目录: $ScriptDir | 通道: $Channel"
     if ($Force) { Write-Warn '强制更新模式' }
     if ($DryRun) { Write-Warn '仅检查模式（不下载）' }
@@ -1040,8 +1053,7 @@ try {
         Write-Warn "正在关闭 MAA (PID: $($maaProc.Id))..."
         if (-not $DryRun) {
             $maaProc.CloseMainWindow() | Out-Null
-            Start-Sleep 1
-            if (-not $maaProc.HasExited) { $maaProc.Kill(); Start-Sleep 2 }
+            if (-not $maaProc.WaitForExit(5000)) { $maaProc.Kill(); Start-Sleep 2 }
         }
     }
 
