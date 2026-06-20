@@ -17,17 +17,32 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
+$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+
+$script:HttpsProxy = ''
+if ($env:HTTPS_PROXY) { $script:HttpsProxy = $env:HTTPS_PROXY } elseif ($env:HTTP_PROXY) { $script:HttpsProxy = $env:HTTP_PROXY }
+if (-not $script:HttpsProxy) {
+    try {
+        $regPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+        $proxyEnabled = (Get-ItemProperty -Path $regPath -Name 'ProxyEnable' -ErrorAction SilentlyContinue).ProxyEnable
+        $proxyServer = (Get-ItemProperty -Path $regPath -Name 'ProxyServer' -ErrorAction SilentlyContinue).ProxyServer
+        if ($proxyEnabled -and $proxyServer) { $script:HttpsProxy = "http://$proxyServer"; Write-Info "检测到系统代理: $($script:HttpsProxy)" }
+    } catch {}
+}
 
 $ApiBase1 = 'https://api.maa.plus/MaaAssistantArknights/api'
 $ApiBase2 = 'https://api2.maa.plus/MaaAssistantArknights/api'
 $MirrorHosts = @(
     'https://agent.imgg.dev',
     'https://ghproxy.net/https://github.com',
-    'https://gh-proxy.com/https://github.com'
+    'https://gh-proxy.com/https://github.com',
+    'https://gh.ddlc.top/https://github.com',
+    'https://gh-proxy.lanlianhua.cn/https://github.com'
 )
 $GithubProxies = @(
     'https://ghproxy.net/',
-    'https://gh-proxy.com/'
+    'https://gh-proxy.com/',
+    'https://mirror.ghproxy.com/'
 )
 $SummaryApi = 'version/summary.json'
 $RetryMax = 3
@@ -57,15 +72,18 @@ function Start-Download {
 
     # 1. curl（优先，TCP 栈优于 .NET）
     if ($hasCurl) {
+        $curlArgs = @('-sSfL', '-o', "$OutFile", '-A', 'MAA-DL/1.0', '--connect-timeout', '15', '--max-time', '600')
+        if ($script:HttpsProxy) { $curlArgs += '--proxy', $script:HttpsProxy }
+        $curlArgs += $Url
         for ($try = 1; $try -le $RetryMax; $try++) {
             if ($try -gt 1) {
                 Write-Warn "curl 重试 ($try/$RetryMax)..."
-                Start-Sleep 2
+                Start-Sleep -Milliseconds (Get-Random -Minimum 500 -Maximum 2500)
             }
             try {
                 if (Test-Path $OutFile) { Remove-Item -Force $OutFile }
                 Write-Info "使用 curl.exe 下载..."
-                $result = curl.exe -sSfL -o "$OutFile" "$Url" -A 'MAA-DL/1.0' --connect-timeout 15 --max-time 600 2>&1
+                $result = curl.exe @curlArgs 2>&1
                 if ($LASTEXITCODE -ne 0) { throw "curl 返回退出码 $LASTEXITCODE : $result" }
                 if (-not (Test-Path $OutFile)) { throw "输出文件未创建" }
                 $actualSize = (Get-Item $OutFile).Length
@@ -88,13 +106,14 @@ function Start-Download {
     for ($try = 1; $try -le $RetryMax; $try++) {
         if ($try -gt 1) {
             Write-Warn "WebClient 重试 ($try/$RetryMax)..."
-            Start-Sleep 2
+            Start-Sleep -Milliseconds (Get-Random -Minimum 500 -Maximum 2500)
         }
         try {
             if (Test-Path $OutFile) { Remove-Item -Force $OutFile }
             Write-Info "使用 WebClient 下载..."
             $wc = New-Object System.Net.WebClient
             $wc.Headers.Add('User-Agent', 'MAA-DL/1.0')
+            if ($script:HttpsProxy) { $wc.Proxy = New-Object System.Net.WebProxy($script:HttpsProxy) }
             $wc.DownloadFile($Url, $OutFile)
             if (-not (Test-Path $OutFile)) { throw "输出文件未创建" }
             $actualSize = (Get-Item $OutFile).Length

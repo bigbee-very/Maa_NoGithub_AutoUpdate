@@ -5,7 +5,7 @@
 MAA（Maa Assistant Arknights，明日方舟游戏助手）是一个开源项目，最新版本放在 GitHub 上。
 但 GitHub 在国内访问很慢甚至打不开，本项目就是为了解决"下不了、更新不了 MAA"的问题。
 
-百度网盘链接： <https://pan.baidu.com/s/1pWRLquJ0_zza0vsFKaXE4A?pwd=1234> 提取码: 1234
+百度网盘链接： <https://pan.baidu.com/s/1fOCk_mOc2-x6kQozbn0SEg?pwd=1234> 提取码: 1234
 
 ## 目录结构
 
@@ -19,8 +19,7 @@ Maa_自动更新脚本(里面文件全部放入maa文件夹内)/
 ├── Maa-Update.ps1               # 核心更新引擎（版本检测、下载、安装、备份、回滚）
 ├── Maa-Debug-Update.bat         # 完整更新，执行完后暂停保留窗口，用于查看输出/反馈问题
 ├── Maa-静默只更新版本.bat       # 只更新 MAA 版本，跳过游戏资源（静默模式）
-├── Maa-静默版本资源全部更新.bat # 更新 MAA 版本 + 游戏资源（静默模式）
-└── PowerShell_Installer.exe     # PowerShell 7 安装包（脚本自动调用）
+└── Maa-静默版本资源全部更新.bat # 更新 MAA 版本 + 游戏资源（静默模式）
 ```
 
 ## 使用方法
@@ -35,11 +34,11 @@ Maa_自动更新脚本(里面文件全部放入maa文件夹内)/
 
 1. 将 `Maa_自动更新脚本(里面文件全部放入maa文件夹内)/` 下所有文件复制到 MAA 安装目录（与 `MAA.exe` 同目录）
 2. 根据需要选择运行：
-   | 脚本                     | 说明                                       |
+   | 脚本 | 说明 |
    | ---------------------- | ---------------------------------------- |
-   | `Maa-Debug-Update.bat` | 完整更新，窗口保留，适合首次运行/查看输出/反馈问题               |
-   | `Maa-静默只更新版本.bat`      | 只更新 MAA 版本，跳过资源更新。资源更新失败时用这个，在 MAA 内更新资源 |
-   | `Maa-静默版本资源全部更新.bat`   | 版本 + 资源全更新，静默模式，用于自动化执行                  |
+   | `Maa-Debug-Update.bat` | 完整更新，窗口保留，适合首次运行/查看输出/反馈问题 |
+   | `Maa-静默只更新版本.bat` | 只更新 MAA 版本，跳过资源更新。资源更新失败时用这个，在 MAA 内更新资源 |
+   | `Maa-静默版本资源全部更新.bat` | 版本 + 资源全更新，静默模式，用于自动化执行 |
    游戏资源更新不稳定,建议在Maa内更新资源.
 
 ### 首次运行说明
@@ -96,7 +95,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "Maa-Update.ps1" > update_lo
 ### 资源更新
 
 - 使用 PowerShell 7 + HTTP/2 下载（国内网络必须）
-- HTTP/2 失败则尝试多源镜像和多策略兜底
+- HTTP/2 失败则尝试多源镜像和多策略兜底（含 jsdelivr CDN）
 
 ### 安装流程
 
@@ -110,19 +109,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "Maa-Update.ps1" > update_lo
 
 ## 主要特性
 
-- **多镜像冗余**：自动从 `agent.imgg.dev`、`ghproxy.net`、`gh-proxy.com` 等多源降级下载
+- **多镜像冗余**：自动从 `agent.imgg.dev`、`ghproxy.net`、`gh-proxy.com`、`jsdelivr CDN` 等多源降级下载
 - **双 API 备份**：主备 API 自动切换，提高版本信息获取成功率
-- **DNS 加速**：自动解析并加速 GitHub 相关域名
+- **智能测速**：自动测试各镜像源延迟，选择最快源下载
+- **系统代理适配**：自动识别 HTTP_PROXY/HTTPS_PROXY 环境变量和 IE 代理设置
 - **多下载引擎**：HTTP/2 → curl → 分片并发 → 单线程，自动降级
 - **自动备份回滚**：备份在 `.update_backup` 文件夹，失败自动恢复
 - **无需手动关闭 MAA**：更新前自动关闭，更新后自动重启
+- **不修改系统网络配置**：使用 curl --resolve 做进程级 DNS 加速，不改 hosts 文件
 
 ## 更新通道
 
 所有脚本默认 `stable` 通道，如需修改，编辑 `.bat` 文件在 PowerShell 调用后添加对应参数：
 
-| 参数               | 说明  |
-| ---------------- | --- |
+| 参数             | 说明   |
+| ---------------- | ------ |
 | `-Channel beta`  | 测试版 |
 | `-Channel alpha` | 开发版 |
 
@@ -135,13 +136,17 @@ A: 用 `Maa-Debug-Update.bat` 查看错误信息。常见原因：文件没放�
 A: 版本更新走 curl 直连不需要 pwsh，只有资源更新才需要 pwsh HTTP/2。可从微软商店安装或手动下载安装包放到 MAA 目录。
 
 **Q: 下载很慢/超时？**
-A: 脚本内置多镜像多策略重试，一般会自动成功。如果总失败，检查网络、重置 hosts 或挂梯子。
+A: 脚本内置多镜像多策略重试，自动选择最快源。如果总失败，检查代理设置或网络环境。
 
 **Q: 更新后 MAA 启动异常？**
 A: 脚本自动保留备份在 `.update_backup`，手动覆盖回 MAA 目录即可回滚。
 
 **Q: 什么是 OTA 增量更新？**
 A: 只下载和旧版本有差异的文件，通常几 MB 到十几 MB，比完整包（几百 MB）快得多。
+
+## 致谢
+
+感谢 [MAA Assistant Arknights](https://github.com/MaaAssistantArknights/MaaAssistantArknights) 项目，本工具仅为社区维护的下载/更新辅助脚本。
 
 ## 免责声明
 
@@ -151,4 +156,3 @@ A: 只下载和旧版本有差异的文件，通常几 MB 到十几 MB，比完�
 - 使用本工具造成的任何数据丢失、文件损坏或软件异常，作者不承担任何责任。
 - 脚本会自动修改 MAA 安装目录下的文件，建议提前备份重要配置。
 - 使用本工具即表示你理解并接受上述条款。
-
