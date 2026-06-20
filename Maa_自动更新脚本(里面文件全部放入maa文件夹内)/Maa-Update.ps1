@@ -24,13 +24,26 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyCon
 [System.Net.ServicePointManager]::DefaultConnectionLimit = 8
 $script:HasCurl = $null -ne (Get-Command 'curl.exe' -ErrorAction SilentlyContinue)
 $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$script:HttpsProxy = ''
+if ($env:HTTPS_PROXY) { $script:HttpsProxy = $env:HTTPS_PROXY } elseif ($env:HTTP_PROXY) { $script:HttpsProxy = $env:HTTP_PROXY }
+
+function Detect-SystemProxy {
+    if ($script:HttpsProxy) { return }
+    try {
+        $regPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+        $proxyEnabled = (Get-ItemProperty -Path $regPath -Name 'ProxyEnable' -ErrorAction SilentlyContinue).ProxyEnable
+        $proxyServer = (Get-ItemProperty -Path $regPath -Name 'ProxyServer' -ErrorAction SilentlyContinue).ProxyServer
+        if ($proxyEnabled -and $proxyServer) { $script:SysProxy = "http://$proxyServer"; Write-Info "检测到系统代理: $($script:SysProxy)"; return }
+    } catch {}
+    $script:SysProxy = $script:HttpsProxy
+    if ($script:SysProxy) { Write-Info "检测到环境变量代理: $($script:SysProxy)" }
+}
 
 # ======== DNS 加速（中国 DNS 解析 + 测速 + hosts/curl-resolve） ========
 $DnsChina = @('223.5.5.5', '114.114.114.114', '119.29.29.29')
 $SlowDomains = @('raw.githubusercontent.com', 'github.com', 'codeload.github.com')
 $script:BestIps = @{}
-$script:HostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
-$script:HostsMarker = '# MAA-Update'
 $script:CurlResolve = @()
 
 function Resolve-DomainFast {
@@ -40,7 +53,7 @@ function Resolve-DomainFast {
         try {
             if ($dns -eq 'System') {
                 $entry = [System.Net.Dns]::GetHostEntry($Domain)
-                $ips = $entry.AddressList | Where-Object { $_ -is [System.Net.IPAddress] -and $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.ToString() }
+                $ips = $entry.AddressList | Where-Object { $_ -is [System.Net.IPAddress] } | ForEach-Object { $_.ToString() }
             }
             else {
                 $raw = & nslookup $Domain $dns 2>$null
@@ -83,29 +96,11 @@ function Initialize-DnsAccel {
                 $script:BestIps[$dom] = $bestIp
                 Write-Ok "$dom → $bestIp (${bestMs}ms)"
                 if ($script:HasCurl) { $script:CurlResolve += "--resolve", "$dom`:443`:$bestIp", "--resolve", "$dom`:80`:$bestIp" }
-                if ($script:IsAdmin) {
-                    $content = Get-Content $script:HostsPath -Raw -ErrorAction SilentlyContinue
-                    if ($content) { $content = $content -replace "(?m)^\d+\.\d+\.\d+\.\d+\s+$dom\s*`n", '' }
-                    "$bestIp $dom $script:HostsMarker" | Out-File $script:HostsPath -Append -Encoding ASCII
-                }
             }
         }
     }
     catch { Write-Warn "DNS 加速失败: $_" }
 }
-function Cleanup-DnsAccel {
-    if ($script:IsAdmin -and (Test-Path $script:HostsPath)) {
-        $content = Get-Content $script:HostsPath -Raw -ErrorAction SilentlyContinue
-        if ($content) {
-            foreach ($dom in $SlowDomains) {
-                $content = $content -replace "(?m)^\d+\.\d+\.\d+\.\d+\s+$dom\s*`n", ''
-            }
-            $content = $content -replace "(?m)^.*$([Regex]::Escape($script:HostsMarker))\s*`n", ''
-            Set-Content $script:HostsPath -Value $content -Encoding ASCII
-        }
-    }
-}
-
 # ======== 配置 ========
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $TempDir = Join-Path $ScriptDir ".update_temp"
@@ -122,15 +117,19 @@ $MaaApiBase2 = 'https://api2.maa.plus/MaaAssistantArknights/api'
 $MirrorHosts = @(
     'https://agent.imgg.dev',
     'https://ghproxy.net/https://github.com',
-    'https://gh-proxy.com/https://github.com'
+    'https://gh-proxy.com/https://github.com',
+    'https://gh.ddlc.top/https://github.com',
+    'https://gh-proxy.lanlianhua.cn/https://github.com'
 )
 $GithubProxies = @(
     'https://ghproxy.net/',
-    'https://gh-proxy.com/'
+    'https://gh-proxy.com/',
+    'https://mirror.ghproxy.com/'
 )
 $ResourceRepo = 'MaaAssistantArknights/MaaResource'
 $ResourceArchiveUrl = "https://github.com/$ResourceRepo/archive/refs/heads/main.zip"
 $ResourceVersionUrl = "https://raw.githubusercontent.com/$ResourceRepo/main/resource/version.json"
+$ResVersionCdnUrl = "https://cdn.jsdelivr.net/gh/$ResourceRepo@main/resource/version.json"
 $SummaryApi = 'version/summary.json'
 $MaxRetries = 2
 $PreserveDirs = @('achievement', 'background', 'cache', 'config', 'data', 'debug')
@@ -368,6 +367,27 @@ function Ensure-Pwsh {
         else { Start-Sleep 2; if (Find-PwshPath) { New-Item -Force $PwshMarkerFile | Out-Null; return $true } }
     }
     if (Find-PwshPath) { New-Item -Force $PwshMarkerFile | Out-Null; return $true }
+    # 从微软 CDN 下载 PowerShell（国内可访问）
+    Write-Info '从微软 CDN 尝试下载 PowerShell 7...'
+    $pwshCdnUrl = "https://dotnetcli.azureedge.net/PowerShell/$pwshVer/PowerShell-$pwshVer-win-x64.msi"
+    $pwshMsiPath = Join-Path $TempDir "PowerShell-$pwshVer-win-x64.msi"
+    $pwshDlOk = $false
+    if ($script:HasCurl) {
+        & curl.exe -L -f -o $pwshMsiPath $pwshCdnUrl --connect-timeout 10 --max-time 120
+        if ($LASTEXITCODE -eq 0 -and (Test-Path $pwshMsiPath)) { $pwshDlOk = $true }
+    }
+    if (-not $pwshDlOk) {
+        try {
+            $wc = New-Object System.Net.WebClient
+            $wc.DownloadFile($pwshCdnUrl, $pwshMsiPath)
+            if (Test-Path $pwshMsiPath) { $pwshDlOk = $true }
+        } catch {}
+    }
+    if ($pwshDlOk) {
+        $p = Start-Process msiexec.exe -ArgumentList "/package `"$pwshMsiPath`" /quiet ADD_PATH=1" -Wait -PassThru -NoNewWindow
+        if ($p.ExitCode -eq 0) { Start-Sleep 2; if (Find-PwshPath) { Remove-Item -Force $pwshMsiPath; Write-Ok 'PowerShell 7 安装成功'; return $true } }
+        Remove-Item -Force $pwshMsiPath -ErrorAction SilentlyContinue
+    }
     # 创建标记，下次不再自动下载
     New-Item -Force $PwshMarkerFile | Out-Null
     Write-Warn 'PowerShell 7 自动安装失败。尝试从微软商店安装：'
@@ -428,12 +448,16 @@ function Start-Download {
 
     # 1. curl.exe（TCP 栈优于 .NET，优先）
     if ($script:HasCurl) {
+        $curlArgs = @('-L', '-f', '-o', $OutFile, '--connect-timeout', '5', '--max-time', '600', '--speed-limit', '10240', '--speed-time', '15')
+        if ($script:SysProxy) { $curlArgs += '--proxy', $script:SysProxy }
+        $curlArgs += $script:CurlResolve
+        $curlArgs += $Url
         for ($try = 1; $try -le $MaxRetries; $try++) {
-            if ($try -gt 1) { Write-Warn "curl 重试第 $try 次..." }
+            if ($try -gt 1) { Write-Warn "curl 重试第 $try 次..."; Start-Sleep -Milliseconds (Get-Random -Minimum 500 -Maximum 2500) }
             try {
                 Write-Info "尝试 curl 下载..."
                 New-Directory (Split-Path $OutFile -Parent)
-                & curl.exe -L -f -o $OutFile --connect-timeout 5 --max-time 600 --speed-limit 10240 --speed-time 15 $script:CurlResolve $Url
+                & curl.exe @curlArgs
                 if ($LASTEXITCODE -eq 0 -and (Test-Path $OutFile)) {
                     $actualSize = (Get-Item $OutFile).Length
                     if ($ExpectedSize -le 0 -or $actualSize -eq $ExpectedSize) {
@@ -457,11 +481,12 @@ function Start-Download {
 
     # 3. 单线程 HttpWebRequest
     for ($try = 1; $try -le $MaxRetries; $try++) {
-        if ($try -gt 1) { Write-Warn "下载重试第 $try 次...正在下载不要关闭程序" }
+        if ($try -gt 1) { Write-Warn "下载重试第 $try 次...正在下载不要关闭程序"; Start-Sleep -Milliseconds (Get-Random -Minimum 500 -Maximum 2500) }
         try {
             $req = [System.Net.HttpWebRequest]::Create($Url)
             $req.Method = 'GET'; $req.Timeout = 15000; $req.ReadWriteTimeout = 60000
             $req.UserAgent = 'MAA-Update/2.2'
+            if ($script:SysProxy) { $req.Proxy = New-Object System.Net.WebProxy($script:SysProxy) }
             $resp = $req.GetResponse()
             $totalLen = $resp.ContentLength
             $stream = $resp.GetResponseStream()
@@ -669,16 +694,35 @@ function Download-UpdatePackage {
     Write-Info "原始: $originalUrl"
 
     $tryOrder = @()
-    # 1. 镜像（替换 github.com 域名）
-    foreach ($m in $MirrorHosts) {
-        $tryOrder += ($originalUrl -replace 'https://github\.com/', "$m/")
-    }
-    # 2. 社区代理（拼接完整 URL）
-    foreach ($p in $GithubProxies) {
-        $tryOrder += "$p$originalUrl"
-    }
-    # 3. 原始 GitHub（兜底）
+    # 0. 构建候选列表
+    $tryOrder = @()
+    foreach ($m in $MirrorHosts) { $tryOrder += ($originalUrl -replace 'https://github\.com/', "$m/") }
+    foreach ($p in $GithubProxies) { $tryOrder += "$p$originalUrl" }
     $tryOrder += $originalUrl
+
+    # 测速排序（仅对前 8 个候选测 HEAD，减少等待）
+    Write-Info "正在测试下载源可用性..."
+    $scoredSources = New-Object System.Collections.Generic.List[object]
+    $testedCount = 0; $allUrls = $tryOrder
+    foreach ($u in $allUrls) {
+        if ($testedCount -ge 8) { break }
+        try {
+            $req = [System.Net.HttpWebRequest]::Create($u)
+            $req.Method = 'HEAD'; $req.Timeout = 3000; $req.ReadWriteTimeout = 3000
+            $req.UserAgent = 'MAA-Update/2.2'
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $resp = $req.GetResponse()
+            $sw.Stop(); $resp.Close()
+            $scoredSources.Add(@{ Url = $u; Ms = $sw.ElapsedMilliseconds })
+        } catch { continue }
+        $testedCount++
+    }
+    if ($scoredSources.Count -gt 0) {
+        $testedSet = @{}; $tryOrder = @()
+        foreach ($s in ($scoredSources | Sort-Object Ms)) { $tryOrder += $s.Url; $testedSet[$s.Url] = $true }
+        foreach ($u in $allUrls) { if (-not $testedSet.ContainsKey($u)) { $tryOrder += $u } }
+        Write-Info "最佳源: $($tryOrder[0]) ($(($scoredSources | Sort-Object Ms)[0].Ms)ms)"
+    }
 
     for ($try = 0; $try -lt $tryOrder.Count -and $try -lt ($MaxRetries + 2); $try++) {
         $url = $tryOrder[$try]
@@ -889,10 +933,14 @@ function Update-Resource {
 
     $remoteJson = Read-ResVersionCache
     if (-not $remoteJson) {
+        $remoteJson = $null
         for ($i = 1; $i -le 2; $i++) {
             if ($i -gt 1) { Write-Info "重试第 $i 次..." }
             Show-Wait "[$i/2] 正在检查资源版本..."
-            $remoteJson = Invoke-GetJson $ResourceVersionUrl -TimeoutSec 10
+            foreach ($ru in @($ResourceVersionUrl, $ResVersionCdnUrl)) {
+                $remoteJson = Invoke-GetJson $ru -TimeoutSec 10
+                if ($remoteJson -and $remoteJson.last_updated) { break }
+            }
             if ($remoteJson -and $remoteJson.last_updated) { Write-ResVersionCache $remoteJson.last_updated; break }
         }
     }
@@ -915,7 +963,8 @@ function Update-Resource {
     $resUrls = @(
         $ResourceArchiveUrl,
         "https://gh-proxy.com/$ResourceArchiveUrl",
-        "https://ghproxy.net/$ResourceArchiveUrl"
+        "https://ghproxy.net/$ResourceArchiveUrl",
+        "https://mirror.ghproxy.com/$ResourceArchiveUrl"
     )
     if (-not $script:HasPwsh) { Write-Info 'pwsh 不可用，HTTP/2 下载将被跳过' }
     for ($try = 1; $try -le 2; $try++) {
@@ -955,7 +1004,6 @@ function Update-Resource {
 
 # ======== 清理 ========
 function Cleanup-Temp {
-    Cleanup-DnsAccel
     foreach ($d in @($TempDir, $BackupDir)) { if (Test-Path $d) { Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue } }
     Write-Info '临时文件已清理'
 }
@@ -986,6 +1034,9 @@ try {
     Get-ChildItem $ScriptDir -Filter "*.temp" | Remove-Item -Force -ErrorAction SilentlyContinue
     if (Test-Path $TempDir) { Remove-Item -Recurse -Force $TempDir -ErrorAction SilentlyContinue }
 
+    # 系统代理检测
+    Detect-SystemProxy
+
     # DNS 加速（解析 + 测速 + hosts/curl-resolve）
     Initialize-DnsAccel
 
@@ -1015,7 +1066,10 @@ try {
             for ($i = 1; $i -le 2; $i++) {
                 if ($i -gt 1) { Start-Sleep 1 }
                 Show-Wait "[$i/2] 正在检查资源版本..."
-                $remoteRj = Invoke-GetJson $ResourceVersionUrl -TimeoutSec 10
+                foreach ($ru in @($ResourceVersionUrl, $ResVersionCdnUrl)) {
+                    $remoteRj = Invoke-GetJson $ru -TimeoutSec 10
+                    if ($remoteRj -and $remoteRj.last_updated) { break }
+                }
                 if ($remoteRj -and $remoteRj.last_updated) {
                     Write-ResVersionCache $remoteRj.last_updated; break
                 }
