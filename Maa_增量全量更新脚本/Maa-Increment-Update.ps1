@@ -1,6 +1,6 @@
 ﻿<#:
 .SYNOPSIS
-    MAA 一键更新脚本 — 无代理 v2.3（带故障冗余）
+    MAA 一键更新脚本 — 无代理 v2.5（带故障冗余）
 .DESCRIPTION
     放置于 MAA 安装目录下直接运行。
     具备下载重试、镜像降级、安装前备份、失败回滚、日志记录、API 缓存等冗余机制。
@@ -19,17 +19,22 @@ param(
     [switch]$DryRun
 )
 
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Continue'
 Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
 [System.Net.ServicePointManager]::DefaultConnectionLimit = 8
 $script:HasCurl = $null -ne (Get-Command 'curl.exe' -ErrorAction SilentlyContinue)
 $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$ProgressPreference = 'SilentlyContinue'
 $script:HttpsProxy = ''
 if ($env:HTTPS_PROXY) { $script:HttpsProxy = $env:HTTPS_PROXY } elseif ($env:HTTP_PROXY) { $script:HttpsProxy = $env:HTTP_PROXY }
 
 function Detect-SystemProxy {
-    if ($script:HttpsProxy) { return }
+    if ($script:HttpsProxy) {
+        $script:SysProxy = $script:HttpsProxy
+        Write-Info "检测到环境变量代理: $($script:SysProxy)"
+        return
+    }
     try {
         $regPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
         $proxyEnabled = (Get-ItemProperty -Path $regPath -Name 'ProxyEnable' -ErrorAction SilentlyContinue).ProxyEnable
@@ -115,17 +120,33 @@ $script:HasPwsh = $false
 $MaaApiBase = 'https://api.maa.plus/MaaAssistantArknights/api'
 $MaaApiBase2 = 'https://api2.maa.plus/MaaAssistantArknights/api'
 $MirrorHosts = @(
-    'https://agent.imgg.dev',
-    'https://ghproxy.net/https://github.com',
-    'https://gh-proxy.com/https://github.com',
-    'https://gh.ddlc.top/https://github.com',
-    'https://gh-proxy.lanlianhua.cn/https://github.com'
+    'https://gh.ddlc.top',
+    'https://gh-proxy.com',
+    'https://agent.imgg.dev'
 )
 $GithubProxies = @(
-    'https://ghproxy.net/',
-    'https://gh-proxy.com/',
-    'https://mirror.ghproxy.com/'
+    'https://gh.ddlc.top/',
+    'https://gh-proxy.com/'
 )
+function Build-MirrorUrls {
+    param([string]$OriginalUrl, [switch]$IncludeArchiveOnly, [switch]$PreferMirror)
+    $urls = @()
+    # 完整包优先走镜像省流量，仅增量包走代理直连
+    if ($script:SysProxy -and -not $PreferMirror) { $urls += $OriginalUrl }
+    foreach ($m in $MirrorHosts) {
+        if ($IncludeArchiveOnly -and $m -eq 'https://agent.imgg.dev') {
+            $urls += $OriginalUrl -replace 'https://github\.com/', "$m/"
+        } else {
+            $urls += "$m/$OriginalUrl"
+        }
+    }
+    foreach ($p in $GithubProxies) {
+        if ($urls -notcontains "$p$OriginalUrl") { $urls += "$p$OriginalUrl" }
+    }
+    if ($script:SysProxy -and $PreferMirror -and $urls -notcontains $OriginalUrl) { $urls += $OriginalUrl }
+    if ($urls -notcontains $OriginalUrl) { $urls += $OriginalUrl }
+    return $urls
+}
 $ResourceRepo = 'MaaAssistantArknights/MaaResource'
 $ResourceArchiveUrl = "https://github.com/$ResourceRepo/archive/refs/heads/main.zip"
 $ResourceVersionUrl = "https://raw.githubusercontent.com/$ResourceRepo/main/resource/version.json"
@@ -424,8 +445,9 @@ try {
 } catch { exit 2 }
 "@ | Set-Content $ps1 -Encoding UTF8
         & $script:PwshPath -NoProfile -File $ps1 $Url $OutFile
+        $http2ExitCode = $LASTEXITCODE
         Remove-Item -Force $ps1 -ErrorAction SilentlyContinue
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $OutFile)) {
+        if ($http2ExitCode -eq 0 -and (Test-Path $OutFile)) {
             $actualSize = (Get-Item $OutFile).Length
             if ($ExpectedSize -le 0 -or $actualSize -eq $ExpectedSize) {
                 Write-Ok "$DisplayName 下载完成 (HTTP/2, $(Format-FileSize $actualSize))"
@@ -437,18 +459,13 @@ try {
     return $false
 }
 
-# ======== 下载（带进度 + 重试 + 校验 + 分片 + BITS + HTTP/2 + curl） ========
+# ======== 下载（curl → HttpWebRequest → pwsh HTTP/2 → 分片） ========
 function Start-Download {
     param([string]$Url, [string]$OutFile, [string]$DisplayName, [long]$ExpectedSize = 0)
 
-    # 0. pwsh HTTP/2 下载（SocketsHttpHandler，适合受限网络）
-    if (Start-Http2Download -Url $Url -OutFile $OutFile -DisplayName $DisplayName -ExpectedSize $ExpectedSize) {
-        return $true
-    }
-
-    # 1. curl.exe（TCP 栈优于 .NET，优先）
+    # 0. curl.exe（TCP 栈优于 .NET，优先）
     if ($script:HasCurl) {
-        $curlArgs = @('-L', '-f', '-o', $OutFile, '--connect-timeout', '5', '--max-time', '600', '--speed-limit', '10240', '--speed-time', '15')
+        $curlArgs = @('-SfL', '-o', $OutFile, '--progress-bar', '--connect-timeout', '5', '--max-time', '600', '--speed-limit', '1024', '--speed-time', '30', '--ssl-no-revoke')
         if ($script:SysProxy) { $curlArgs += '--proxy', $script:SysProxy }
         $curlArgs += $script:CurlResolve
         $curlArgs += $Url
@@ -474,12 +491,7 @@ function Start-Download {
         }
     }
 
-    # 2. 分片下载（>10MB 大文件加速）
-    if (Start-SegmentedDownload -Url $Url -OutFile $OutFile -DisplayName $DisplayName -ExpectedSize $ExpectedSize) {
-        return $true
-    }
-
-    # 3. 单线程 HttpWebRequest
+    # 1. 单线程 HttpWebRequest（带 Write-Progress 进度条）
     for ($try = 1; $try -le $MaxRetries; $try++) {
         if ($try -gt 1) { Write-Warn "下载重试第 $try 次...正在下载不要关闭程序"; Start-Sleep -Milliseconds (Get-Random -Minimum 500 -Maximum 2500) }
         try {
@@ -518,7 +530,17 @@ function Start-Download {
     }
     Write-Progress -Activity "下载 $DisplayName" -Completed
 
-    Write-Err "$DisplayName 下载失败（curl/分片/HTTP 均不可用）"
+    # 2. pwsh HTTP/2 下载（SocketsHttpHandler，受限网络兜底）
+    if (Start-Http2Download -Url $Url -OutFile $OutFile -DisplayName $DisplayName -ExpectedSize $ExpectedSize) {
+        return $true
+    }
+
+    # 3. 分片下载（>10MB 大文件加速，最后兜底）
+    if (Start-SegmentedDownload -Url $Url -OutFile $OutFile -DisplayName $DisplayName -ExpectedSize $ExpectedSize) {
+        return $true
+    }
+
+    Write-Err "$DisplayName 下载失败（curl/HttpWebRequest/HTTP/2/分片 均不可用）"
     return $false
 }
 
@@ -674,12 +696,13 @@ function Check-VersionUpdate {
         if ($name.Contains('OTA') -and $name.Contains($currentVer)) { $otaAsset = $a; Write-Info "找到匹配的 OTA 包: $name"; break }
         if ($name -match "^MAA-v[\d\.]+\-win-$arch\.zip$") { $fullAsset = $a }
     }
+    # 总是优先 OTA，同时保留完整包作为第二级回退
     $selected = $otaAsset; $pkgType = 'OTA'
-    if (-not $selected) { $selected = $fullAsset; $pkgType = '完整包' }
+    if (-not $selected -and $fullAsset) { $selected = $fullAsset; $pkgType = '完整包' }
     if (-not $selected) { Write-Err "未找到适用于 win-$arch 的更新包"; return $null }
 
-    Write-Info "新版本: $latestVer"
-    return @{ Version = $latestVer; Type = $pkgType; Asset = $selected; DetailJson = $detail; Arch = $arch }
+    Write-Info "新版本: $latestVer ($pkgType)"
+    return @{ Version = $latestVer; Type = $pkgType; Asset = $selected; FullAsset = $fullAsset; DetailJson = $detail; Arch = $arch }
 }
 
 # ======== 下载更新（镜像列表冗余） ========
@@ -692,13 +715,8 @@ function Download-UpdatePackage {
     $originalUrl = $asset.browser_download_url
 
     Write-Info "原始: $originalUrl"
-
-    $tryOrder = @()
-    # 0. 构建候选列表
-    $tryOrder = @()
-    foreach ($m in $MirrorHosts) { $tryOrder += ($originalUrl -replace 'https://github\.com/', "$m/") }
-    foreach ($p in $GithubProxies) { $tryOrder += "$p$originalUrl" }
-    $tryOrder += $originalUrl
+    $preferMirror = ($UpdateInfo.Type -ne 'OTA')  # 完整包优先走镜像省代理流量
+    $tryOrder = Build-MirrorUrls $originalUrl -PreferMirror:$preferMirror
 
     # 测速排序（仅对前 8 个候选测 HEAD，减少等待）
     Write-Info "正在测试下载源可用性..."
@@ -960,12 +978,7 @@ function Update-Resource {
     # 资源包下载 - 多源多策略重试
     $resZip = Join-Path $TempDir 'MaaResource.zip'
     $dlOk = $false
-    $resUrls = @(
-        $ResourceArchiveUrl,
-        "https://gh-proxy.com/$ResourceArchiveUrl",
-        "https://ghproxy.net/$ResourceArchiveUrl",
-        "https://mirror.ghproxy.com/$ResourceArchiveUrl"
-    )
+    $resUrls = Build-MirrorUrls $ResourceArchiveUrl -IncludeArchiveOnly -PreferMirror
     if (-not $script:HasPwsh) { Write-Info 'pwsh 不可用，HTTP/2 下载将被跳过' }
     for ($try = 1; $try -le 2; $try++) {
         if ($try -gt 1) { Write-Info "资源下载重试第 $try 次..."; Start-Sleep 2 }
@@ -1002,6 +1015,25 @@ function Update-Resource {
     return $true
 }
 
+# ======== 全量下载回退（增量失败时调用） ========
+function Invoke-FullDownload {
+    $fullDlScript = Join-Path $ScriptDir 'Maa-FullAmount-Download.ps1'
+    if (-not (Test-Path $fullDlScript)) {
+        Write-Warn "全量下载脚本不存在: $fullDlScript"
+        return $false
+    }
+    Write-Warn '增量更新失败，尝试全量下载覆盖...'
+    try {
+        & $fullDlScript -Channel $Channel -Silent
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok '全量下载覆盖完成'
+            return $true
+        }
+    }
+    catch { Write-Warn "全量下载异常: $_" }
+    return $false
+}
+
 # ======== 清理 ========
 function Cleanup-Temp {
     foreach ($d in @($TempDir, $BackupDir)) { if (Test-Path $d) { Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue } }
@@ -1012,7 +1044,7 @@ function Cleanup-Temp {
 try {
     # 清旧日志，写新日志
     if (Test-Path $LogFile) { Remove-Item -Force $LogFile -ErrorAction SilentlyContinue }
-    Write-Log 'INFO' "=== MAA 更新脚本 v2.3 启动 ==="
+    Write-Log 'INFO' "=== MAA 更新脚本 v2.5 启动 ==="
     Write-Log 'INFO' "目录: $ScriptDir | 通道: $Channel"
     if ($Force) { Write-Warn '强制更新模式' }
     if ($DryRun) { Write-Warn '仅检查模式（不下载）' }
@@ -1096,9 +1128,31 @@ try {
     $pkgPath = $null
     $updateApplied = $false
 
-    # 1. 下载更新包（MAA 仍可运行）
+    # 1. 下载更新包（三级回退：OTA → 完整包 → 全量下载覆盖）
     if ($updateInfo) {
+        # 第一优先级：OTA 增量包
         $pkgPath = Download-UpdatePackage $updateInfo
+
+        # 第二优先级：OTA 失败时尝试完整包
+        if (-not $pkgPath -and $updateInfo.FullAsset -and $updateInfo.Type -eq 'OTA') {
+            Write-Warn 'OTA 下载失败，尝试完整包...'
+            $fullInfo = @{
+                Version = $updateInfo.Version
+                Type = '完整包'
+                Asset = $updateInfo.FullAsset
+                DetailJson = $updateInfo.DetailJson
+                Arch = $updateInfo.Arch
+            }
+            $pkgPath = Download-UpdatePackage $fullInfo
+        }
+
+        # 第三优先级：完整包也失败 → 全量下载覆盖
+        if (-not $pkgPath -and -not $DryRun) {
+            if (Invoke-FullDownload) {
+                $updateApplied = $true
+                $updateInfo = $null
+            }
+        }
     }
 
     # 2. 关闭 MAA（安装前才关）
@@ -1116,6 +1170,10 @@ try {
         $updateApplied = Install-Update -PackagePath $pkgPath -UpdateInfo $updateInfo
         if (Test-Path $pkgPath) { Remove-Item -Force $pkgPath -ErrorAction SilentlyContinue }
         if (-not $updateApplied -and (Test-Path $BackupDir)) { Restore-Backup }
+        # 增量安装失败 → 全量下载回退
+        if (-not $updateApplied -and -not $DryRun) {
+            if (Invoke-FullDownload) { $updateApplied = $true }
+        }
     }
 
     # 4. 资源更新
