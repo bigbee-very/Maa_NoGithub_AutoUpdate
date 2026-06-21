@@ -176,7 +176,9 @@ function Install-To-MaaDir {
         'Maa-增量-更新-Debug.bat',
         'Maa-增量-静默版本资源全部更新.bat',
         'Maa-增量-静默只更新版本.bat',
-        '使用前阅读此文件.txt'
+        '使用前阅读此文件.txt',
+        'adb',
+        'resource'
     )
     $zipName = Split-Path $ZipPath -Leaf
     if ($zipName -and $whitelist -notcontains $zipName) { $whitelist += $zipName }
