@@ -159,15 +159,15 @@ function Install-To-MaaDir {
 
     Write-Step '检测到 MAA 安装目录，执行自动安装'
 
-    # 1. 备份 config/、data/、resource/
+    # 1. 备份白名单目录（config/data/resource/debug）
     $bakDir = Join-Path $env:TEMP "maa_install_bak_$(Get-Random)"
     New-Item -ItemType Directory -Path $bakDir -Force | Out-Null
-    foreach ($dir in @('config', 'data', 'resource')) {
+    foreach ($dir in @('config', 'data', 'resource', 'debug')) {
         $src = Join-Path $ScriptDir $dir
         if (Test-Path $src) { Copy-Item -Recurse $src (Join-Path $bakDir $dir) -Force }
     }
 
-    # 2. 白名单（不删除）
+    # 2. 白名单（不删除 + 不解压覆盖）
     $whitelist = @(
         'Maa-FullAmount-Download.ps1',
         'Maa-Increment-Update.ps1',
@@ -178,7 +178,10 @@ function Install-To-MaaDir {
         'Maa-增量-静默只更新版本.bat',
         '使用前阅读此文件.txt',
         'adb',
-        'resource'
+        'resource',
+        'data',
+        'config',
+        'debug'
     )
     $zipName = Split-Path $ZipPath -Leaf
     if ($zipName -and $whitelist -notcontains $zipName) { $whitelist += $zipName }
@@ -203,16 +206,18 @@ function Install-To-MaaDir {
     $entries = Get-ChildItem $extractDir
     $sourceDir = if ($entries.Count -eq 1 -and $entries[0].PSIsContainer) { $entries[0].FullName } else { $extractDir }
 
-    # 复制到 ScriptDir
+    # 复制到 ScriptDir（跳过白名单顶层目录，保留已有文件）
     Get-ChildItem $sourceDir -Recurse | ForEach-Object {
         $rel = $_.FullName.Substring($sourceDir.Length + 1)
+        $topDir = ($rel -split '[\\/]')[0]
+        if ($topDir -in $whitelist) { return }
         $dest = Join-Path $ScriptDir $rel
         if ($_.PSIsContainer) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
         else { New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null; Copy-Item $_.FullName $dest -Force }
     }
-
-    # 5. 恢复 config/data/resource（跳过已有文件，保留 zip 的新文件）
-    foreach ($dir in @('config', 'data', 'resource')) {
+    
+    # 5. 恢复白名单目录中的旧文件（跳过已有，保留新 zip 未覆盖的部分）
+    foreach ($dir in @('config', 'data', 'resource', 'debug')) {
         $bakPath = Join-Path $bakDir $dir
         if (-not (Test-Path $bakPath)) { continue }
         Get-ChildItem $bakPath -Recurse | ForEach-Object {
