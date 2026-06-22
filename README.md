@@ -5,7 +5,7 @@
 MAA（Maa Assistant Arknights，明日方舟游戏助手）是一个开源项目，最新版本放在 GitHub 上。
 但 GitHub 在国内访问很慢甚至打不开，本项目就是为了解决"下不了、更新不了 MAA"的问题。
 
-百度网盘链接： <https://pan.baidu.com/s/1CTNo8kfEExEeJKd8nYo_iw?pwd=1234> 提取码: 1234
+百度网盘链接： <https://pan.baidu.com/s/1HXNonZ3gqJoHeSlJhUJRpg?pwd=1234> 提取码: 1234
 
 ## 两种更新方式对比
 
@@ -77,13 +77,18 @@ Maa_NoGithub_Update/
 ├── README.md
 ├── Maa_增量全量更新脚本/                    # 全量下载 + 增量更新（推荐）
 │   ├── 使用前阅读此文件.txt                 # 全量+增量使用说明
-│   ├── Maa-FullAmount-Download.ps1         # 核心下载引擎（全量）
+│   ├── Maa-FullUpdate-Download.ps1         # 核心下载引擎（全量）
 │   ├── Maa-Increment-Update.ps1            # 核心更新引擎（增量）
 │   ├── Maa-全量更新-静默.bat                # 双击下载（静默模式）
 │   ├── Maa-全量更新-Debug.bat              # 双击下载（保留窗口，查看输出）
+│   ├── Maa-全量更新-静默(beta).bat          # 公测版全量下载（静默模式）
+│   ├── Maa-全量更新-Debug(beta).bat        # 公测版全量下载（保留窗口）
 │   ├── Maa-增量-更新-Debug.bat             # 增量更新（保留窗口，查看输出）
+│   ├── Maa-增量-更新-Debug(beta).bat       # 公测版增量更新（保留窗口）
 │   ├── Maa-增量-静默版本资源全部更新.bat     # 增量更新（版本+资源）
-│   └── Maa-增量-静默只更新版本.bat          # 增量更新（只更新版本）
+│   ├── Maa-增量-静默版本资源全部更新(beta).bat # 公测版增量更新（版本+资源）
+│   ├── Maa-增量-静默只更新版本.bat          # 增量更新（只更新版本）
+│   └── Maa-增量-静默只更新版本(beta).bat    # 公测版增量更新（只更新版本）
 ```
 
 ## 详细使用说明
@@ -122,11 +127,14 @@ Maa_NoGithub_Update/
 
 #### 日常使用
 
-| 脚本                                | 说明                                     |
-| ----------------------------------- | ---------------------------------------- |
-| `Maa-增量-静默版本资源全部更新.bat` | 版本+资源全更新（推荐）                  |
-| `Maa-增量-静默只更新版本.bat`       | 只更新版本，跳过资源更新                 |
-| `Maa-增量-更新-Debug.bat`           | 保留窗口，适合首次运行/查看输出/反馈问题 |
+| 脚本                                      | 说明                                     |
+| ----------------------------------------- | ---------------------------------------- |
+| `Maa-增量-静默版本资源全部更新.bat`       | 版本+资源全更新（正式版，推荐）          |
+| `Maa-增量-静默只更新版本.bat`             | 只更新版本，跳过资源更新（正式版）       |
+| `Maa-增量-更新-Debug.bat`                 | 保留窗口，适合首次运行/查看输出/反馈问题 |
+| `Maa-增量-静默版本资源全部更新(beta).bat` | 版本+资源全更新（公测版）                |
+| `Maa-增量-静默只更新版本(beta).bat`       | 只更新版本，跳过资源更新（公测版）       |
+| `Maa-增量-更新-Debug(beta).bat`           | 保留窗口调试（公测版）                   |
 
 游戏资源更新不稳定，建议在 MAA 内更新资源。
 
@@ -157,13 +165,7 @@ Maa_NoGithub_Update/
 
 推荐方法：运行 Debug 脚本，右键标题栏 → 编辑 → 全选 → 复制。
 
-保存到文件：在 MAA 目录打开 cmd，执行：
-
-```
-powershell -NoProfile -ExecutionPolicy Bypass -File "Maa-Increment-Update.ps1" > update_log.txt 2>&1
-```
-
-生成的 `update_log.txt` 为完整日志，可发送给开发者分析。
+MAA安装目录文件夹中生成的 `update_log.txt` 为完整日志，可发送给开发者分析。
 
 ## 运行要求
 
@@ -177,19 +179,27 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "Maa-Increment-Update.ps1" >
 - **智能测速**：每次运行时自动测试各镜像源延迟，选择最快源下载
 - **系统代理适配**：自动识别 HTTP_PROXY/HTTPS_PROXY 环境变量和 IE 代理设置
 - **多下载引擎**：curl → HttpWebRequest → HTTP/2 → 分片，自动降级
-- **增量/全量双保险**：增量更新失败时自动调用 `Maa-FullAmount-Download.ps1` 全量覆盖
+- **增量/全量双保险**：增量更新失败时自动调用 `Maa-FullUpdate-Download.ps1` 全量覆盖
 - **自动备份回滚**：备份在 `.update_backup` 文件夹，失败自动恢复
 - **无需手动关闭 MAA**：更新前自动关闭，更新后自动重启
 - **不修改系统网络配置**：使用 curl --resolve 做进程级 DNS 加速，不改 hosts 文件
 
 ## 更新通道
 
-所有脚本默认 `stable` 通道，如需修改，编辑 `.bat` 文件在 PowerShell 调用后添加对应参数：
+默认使用 `stable` 通道。三种方式切换：
 
-| 参数             | 说明   |
-| ---------------- | ------ |
-| `-Channel beta`  | 测试版 |
-| `-Channel alpha` | 开发版 |
+1. **使用独立 bat 文件**（推荐）：双击 `(beta)` 后缀的 bat 即可更新到公开测试版
+2. **在现有 bat 后加参数**：`Maa-增量-静默版本资源全部更新.bat -Channel beta`
+
+| 参数             | 说明       |
+| ---------------- | ---------- |
+| `-Channel beta`  | 公开测试版 |
+| `-Channel alpha` | 开发版     |
+
+从较旧版本首次切换到 beta 通道时，MAA 官方可能未提供
+从该旧版本直达公测版的 OTA 增量包。此时脚本会自动回退下载
+最新的正式版完整包。**第二次运行**时，即可从正式版匹配到
+公测版的 OTA 增量包完成切换。此为正常行为，运行两次即可。
 
 ## 常见问题
 
