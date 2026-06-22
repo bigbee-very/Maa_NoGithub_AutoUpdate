@@ -551,7 +551,7 @@ function Get-CurrentVersion {
     if (Test-Path $exePath) {
         try {
             $ver = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exePath)
-            foreach ($prop in @($ver.FileVersion, $ver.ProductVersion)) {
+            foreach ($prop in @($ver.ProductVersion, $ver.FileVersion)) {
                 if ($prop -and ($prop -notmatch '^0+(\.0+)*$')) {
                     $v = "v$(($prop -split '\+')[0].TrimStart('v'))"
                     Write-Info "当前版本 (MAA.exe): $v"; return $v
@@ -565,7 +565,7 @@ function Get-CurrentVersion {
     if (Test-Path $dllPath) {
         try {
             $ver = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($dllPath)
-            foreach ($prop in @($ver.FileVersion, $ver.ProductVersion)) {
+            foreach ($prop in @($ver.ProductVersion, $ver.FileVersion)) {
                 if ($prop -and ($prop -notmatch '^0+(\.0+)*$')) {
                     $v = "v$(($prop -split '\+')[0].TrimStart('v'))"
                     Write-Info "当前版本 (MaaCore.dll): $v"; return $v
@@ -694,7 +694,7 @@ function Check-VersionUpdate {
         if (-not $name.Contains('win')) { continue }
         if (($isArm) -xor ($name.Contains('arm64'))) { continue }
         if ($name.Contains('OTA') -and $name.Contains($currentVer)) { $otaAsset = $a; Write-Info "找到匹配的 OTA 包: $name"; break }
-        if ($name -match "^MAA-v[\d\.]+\-win-$arch\.zip$") { $fullAsset = $a }
+        if ($name -match "^MAA-v[\d\.]+(?:-[\w\.]+)?\-win-$arch\.zip$") { $fullAsset = $a }
     }
     # 总是优先 OTA，同时保留完整包作为第二级回退
     $selected = $otaAsset; $pkgType = 'OTA'
