@@ -286,7 +286,7 @@ if (-not $detail) {
 
 $asset = $null
 foreach ($a in $detail.details.assets) {
-    if ($a.name -match "^MAA-v[\d\.]+\-win-x64\.zip$") { $asset = $a; break }
+    if ($a.name -match "^MAA-v[\d\.]+(?:-[\w\.]+)?\-win-x64\.zip$") { $asset = $a; break }
 }
 if (-not $asset) {
     Write-Err '未找到适用于 win-x64 的更新包'

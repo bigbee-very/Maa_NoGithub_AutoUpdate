@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title MAA Download & Overwrite
+title MAA Download ^& Overwrite
 echo.
 echo   Downloading - please wait, do NOT close this window
 echo.
