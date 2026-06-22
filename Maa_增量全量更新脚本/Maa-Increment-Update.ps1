@@ -1,6 +1,6 @@
 ﻿<#:
 .SYNOPSIS
-    MAA 一键更新脚本 — 无代理 v2.5（带故障冗余）
+    MAA 一键更新脚本 — 无代理 v3.1（带故障冗余）
 .DESCRIPTION
     放置于 MAA 安装目录下直接运行。
     具备下载重试、镜像降级、安装前备份、失败回滚、日志记录、API 缓存等冗余机制。
@@ -620,7 +620,7 @@ function Read-ResVersionCache {
     try {
         $cache = Get-Content $ResCacheFile -Raw -Encoding UTF8 | ConvertFrom-Json
         $age = [DateTime]::Now - [DateTime]::ParseExact($cache.cached_at, 'yyyy-MM-dd HH:mm:ss', $null)
-        if ($age.TotalHours -le 24) { return $cache }
+        if ($age.TotalHours -le 4) { return $cache }
     }
     catch {}
     return $null
@@ -1017,7 +1017,7 @@ function Update-Resource {
 
 # ======== 全量下载回退（增量失败时调用） ========
 function Invoke-FullDownload {
-    $fullDlScript = Join-Path $ScriptDir 'Maa-FullAmount-Download.ps1'
+    $fullDlScript = Join-Path $ScriptDir 'Maa-FullUpdate-Download.ps1'
     if (-not (Test-Path $fullDlScript)) {
         Write-Warn "全量下载脚本不存在: $fullDlScript"
         return $false
@@ -1044,7 +1044,7 @@ function Cleanup-Temp {
 try {
     # 清旧日志，写新日志
     if (Test-Path $LogFile) { Remove-Item -Force $LogFile -ErrorAction SilentlyContinue }
-    Write-Log 'INFO' "=== MAA 更新脚本 v2.5 启动 ==="
+    Write-Log 'INFO' "=== MAA 更新脚本 v3.1 启动 ==="
     Write-Log 'INFO' "目录: $ScriptDir | 通道: $Channel"
     if ($Force) { Write-Warn '强制更新模式' }
     if ($DryRun) { Write-Warn '仅检查模式（不下载）' }

@@ -169,13 +169,18 @@ function Install-To-MaaDir {
 
     # 2. 白名单（不删除 + 不解压覆盖）
     $whitelist = @(
-        'Maa-FullAmount-Download.ps1',
+        'Maa-FullUpdate-Download.ps1',
         'Maa-Increment-Update.ps1',
         'Maa-全量更新-静默.bat',
         'Maa-全量更新-Debug.bat',
         'Maa-增量-更新-Debug.bat',
         'Maa-增量-静默版本资源全部更新.bat',
         'Maa-增量-静默只更新版本.bat',
+        'Maa-全量更新-静默(beta).bat',
+        'Maa-全量更新-Debug(beta).bat',
+        'Maa-增量-更新-Debug(beta).bat',
+        'Maa-增量-静默版本资源全部更新(beta).bat',
+        'Maa-增量-静默只更新版本(beta).bat',
         '使用前阅读此文件.txt',
         'adb',
         'resource',
