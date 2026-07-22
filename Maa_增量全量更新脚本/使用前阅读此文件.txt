@@ -58,16 +58,7 @@ MAA 下载与更新脚本 - 使用说明
 1. 将本文件夹内所有文件**复制**到 MAA 安装目录（与 MAA.exe 同目录）
 2. 双击 `Maa-增量-更新-Debug.bat`（保留窗口，便于查看输出）
 3. 第一次启动会慢，请耐心等待
-4. 脚本会自动检测并安装 PowerShell 7（用于 HTTP/2 下载）
 
-如网络问题无法自动下载 PowerShell 7，按以下顺序尝试：
-1. 从微软商店安装（国内可正常访问）：
-   https://apps.microsoft.com/detail/9mz1snwt0n5d?hl=zh-CN&gl=CN
-2. 脚本会自动从微软 CDN 下载安装（dotnetcli.azureedge.net）
-3. 手动下载安装包放到 MAA 文件夹：
-   a. 打开 https://github.com/PowerShell/PowerShell/releases
-   b. 下载 PowerShell-7.6.2-win-x64.msi 或 .zip
-   c. 放到 MAA 程序文件夹，脚本会自动识别安装
 
 ### 日常使用
 
