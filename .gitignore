@@ -7,6 +7,12 @@ MAA-*.zip
 # 解压的 MAA 目录
 MAA-v*-win-x64/
 
+# 下载的 MaaEnd 发布包
+MaaEnd-*.zip
+
+# MaaEnd 安装目录
+MaaEnd/
+
 # 构建输出
 bin/
 

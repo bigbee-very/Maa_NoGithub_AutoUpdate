@@ -1,9 +1,11 @@
 # Maa NoGithub AutoUpdate
 
-针对无法正常访问 GitHub 的用户，提供的 MAA 下载与更新工具集。
+针对无法正常访问 GitHub 的用户，提供的 **MAA** 与 **MaaEnd** 下载与更新工具集。
 
-MAA（Maa Assistant Arknights，明日方舟游戏助手）是一个开源项目，最新版本放在 GitHub 上。
-但 GitHub 在国内访问很慢甚至打不开，本项目就是为了解决"下不了、更新不了 MAA"的问题。
+- **MAA**（Maa Assistant Arknights，明日方舟游戏助手）是一个开源项目，最新版本放在 GitHub 上。
+- **MaaEnd**（明日方舟：终末地助手）同样是基于 MaaFramework 的开源项目，托管在 GitHub。
+
+但 GitHub 在国内访问很慢甚至打不开，本项目就是为了解决"下不了、更新不了"的问题。
 
 百度网盘链接： <https://pan.baidu.com/s/1pxtJydM4grywq756zTTFpg?pwd=1234> 提取码: 1234
 
@@ -75,7 +77,7 @@ MAA（Maa Assistant Arknights，明日方舟游戏助手）是一个开源项目
 ```
 Maa_NoGithub_Update/
 ├── README.md
-├── Maa_增量全量更新脚本/                    # 全量下载 + 增量更新（推荐）
+├── Maa_增量全量更新脚本/                    # MAA 全量下载 + 增量更新（推荐）
 │   ├── 使用前阅读此文件.txt                 # 全量+增量使用说明
 │   ├── Maa-FullUpdate-Download.ps1         # 核心下载引擎（全量）
 │   ├── Maa-Increment-Update.ps1            # 核心更新引擎（增量）
@@ -89,6 +91,20 @@ Maa_NoGithub_Update/
 │   ├── Maa-增量-静默版本资源全部更新(beta).bat # 公测版增量更新（版本+资源）
 │   ├── Maa-增量-静默只更新版本.bat          # 增量更新（只更新版本）
 │   └── Maa-增量-静默只更新版本(beta).bat    # 公测版增量更新（只更新版本）
+│
+├── MaaEnd_增量全量更新脚本/                 # MaaEnd 全量下载
+│   ├── 使用前阅读此文件.txt                 # 使用说明
+│   ├── MaaEnd-FullUpdate-Download.ps1     # 核心下载引擎（全量）
+│   ├── MaaEnd-全量更新-静默.bat            # 双击下载（静默模式）
+│   ├── MaaEnd-全量更新-Debug.bat          # 双击下载（保留窗口，查看输出）
+│   ├── MaaEnd-全量更新-静默(beta).bat      # 公测版全量下载（静默模式）
+│   └── MaaEnd-全量更新-Debug(beta).bat    # 公测版全量下载（保留窗口）
+│
+└── MaaEnd/                                # MaaEnd 安装目录（脚本自动生成）
+    ├── MaaEnd.exe
+    ├── interface.json
+    ├── config/
+    └── debug/
 ```
 
 ## 详细使用说明
@@ -181,8 +197,9 @@ MAA安装目录文件夹中生成的 `update_log.txt` 为完整日志，可发�
 - **多下载引擎**：curl → HttpWebRequest → HTTP/2 → 分片，自动降级
 - **增量/全量双保险**：增量更新失败时自动调用 `Maa-FullUpdate-Download.ps1` 全量覆盖
 - **自动备份回滚**：备份在 `.update_backup` 文件夹，失败自动恢复
-- **无需手动关闭 MAA**：更新前自动关闭，更新后自动重启
+- **无需手动关闭 MAA/MaaEnd**：更新前自动关闭，更新后自动重启
 - **不修改系统网络配置**：使用 curl --resolve 做进程级 DNS 加速，不改 hosts 文件
+- **MaaEnd API 降级**：`api.github.com` 不可达时，从网页抓取版本列表继续工作
 
 ## 更新通道
 
@@ -201,6 +218,39 @@ MAA安装目录文件夹中生成的 `update_log.txt` 为完整日志，可发�
 最新的正式版完整包。**第二次运行**时，即可从正式版匹配到
 公测版的 OTA 增量包完成切换。此为正常行为，运行两次即可。
 
+## MaaEnd 下载与更新
+
+MaaEnd（明日方舟：终末地助手）仅有全量下载方式，不提供增量 OTA 包。
+
+### 使用方法
+
+1. 将 `MaaEnd_增量全量更新脚本\` 文件夹复制到你想放 MaaEnd 的位置
+2. 双击 `MaaEnd-全量更新-静默.bat`
+3. 等待下载完成（约 220MB）
+4. 脚本自动执行：
+   - 检测 `api.github.com` 是否可达，不可达则从 `github.com` 网页抓取版本列表
+   - 镜像优先下载（`gh.ddlc.top` → `gh-proxy.com`），GitHub 原链兜底
+   - 检测当前目录是否为 MaaEnd 安装目录（有 `MaaEnd.exe`）
+   - 如果是：关闭 MaaEnd → 备份 config/debug → 清理旧文件 → 解压覆盖 → 恢复配置 → 重启 MaaEnd
+   - 如果不是：仅下载 zip，需手动解压
+
+### 更新通道
+
+| 脚本                           | 说明                     |
+| ------------------------------ | ------------------------ |
+| `MaaEnd-全量更新-静默.bat`     | 正式版（静默模式）       |
+| `MaaEnd-全量更新-Debug.bat`    | 正式版（保留窗口）       |
+| `MaaEnd-全量更新-静默(beta).bat` | 预发布版（静默模式）   |
+| `MaaEnd-全量更新-Debug(beta).bat` | 预发布版（保留窗口） |
+
+### 特性
+
+- **自动关闭/重启**：更新前自动关闭 MaaEnd 进程，更新后自动启动
+- **API 降级**：`api.github.com` 不可达时，从 `github.com` tags 页面抓取版本信息
+- **版本比对**：读取本地 `interface.json` 获取当前版本，已是最新则跳过下载
+- **镜像冗余**：多镜像源降级下载，GitHub 原链兜底
+- **配置保留**：自动保留 `config/`、`debug/` 目录
+
 ## 常见问题
 
 **Q: 双击 .bat 闪一下就消失？**
@@ -212,7 +262,7 @@ A: 版本更新走 curl 直连不需要 pwsh，只有资源更新才需要 pwsh 
 **Q: 下载很慢/超时？**
 A: 脚本内置多镜像多策略重试，自动选择最快源。如果总失败，检查代理设置或网络环境。
 
-**Q: 更新后 MAA 启动异常？**
+**Q: 更新后 MAA/MaaEnd 启动异常？**
 A: 脚本自动保留备份在 `.update_backup`，手动覆盖回 MAA 目录即可回滚。
 
 **Q: 什么是 OTA 增量更新？**
@@ -220,13 +270,15 @@ A: 只下载和旧版本有差异的文件，通常几 MB 到几十 MB，比完�
 
 ## 致谢
 
-感谢 [MAA Assistant Arknights](https://github.com/MaaAssistantArknights/MaaAssistantArknights) 项目，本工具仅为社区维护的下载/更新辅助脚本。
+- 感谢 [MAA Assistant Arknights](https://github.com/MaaAssistantArknights/MaaAssistantArknights) 项目
+- 感谢 [MaaEnd](https://github.com/MaaEnd/MaaEnd) 项目
+- 本工具仅为社区维护的下载/更新辅助脚本
 
 ## 免责声明
 
-- 测试最早 6.10.7 版本，更古老版本无法确定正常使用
+- 测试最早 6.10.7 版本（MAA），更古老版本无法确定正常使用
 - 纯 vibe coding 产物，不保证稳定运行
-- 本工具集为第三方维护的社区工具，与 MAA 官方无直接关联
+- 本工具集为第三方维护的社区工具，与 MAA / MaaEnd 官方无直接关联
 - 使用本工具造成的任何数据丢失、文件损坏或软件异常，作者不承担任何责任
-- 脚本会自动修改 MAA 安装目录下的文件，建议提前备份重要配置
+- 脚本会自动修改 MAA / MaaEnd 安装目录下的文件，建议提前备份重要配置
 - 使用本工具即表示你理解并接受上述条款

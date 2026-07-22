@@ -131,8 +131,6 @@ $GithubProxies = @(
 function Build-MirrorUrls {
     param([string]$OriginalUrl, [switch]$IncludeArchiveOnly, [switch]$PreferMirror)
     $urls = @()
-    # 完整包优先走镜像省流量，仅增量包走代理直连
-    if ($script:SysProxy -and -not $PreferMirror) { $urls += $OriginalUrl }
     foreach ($m in $MirrorHosts) {
         if ($IncludeArchiveOnly -and $m -eq 'https://agent.imgg.dev') {
             $urls += $OriginalUrl -replace 'https://github\.com/', "$m/"
@@ -715,7 +713,7 @@ function Download-UpdatePackage {
     $originalUrl = $asset.browser_download_url
 
     Write-Info "原始: $originalUrl"
-    $preferMirror = ($UpdateInfo.Type -ne 'OTA')  # 完整包优先走镜像省代理流量
+    $preferMirror = $true  # 始终优先使用镜像站
     $tryOrder = Build-MirrorUrls $originalUrl -PreferMirror:$preferMirror
 
     # 测速排序（仅对前 8 个候选测 HEAD，减少等待）
