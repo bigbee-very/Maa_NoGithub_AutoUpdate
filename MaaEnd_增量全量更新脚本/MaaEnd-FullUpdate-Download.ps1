@@ -18,6 +18,9 @@ param(
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 $OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+# SSL/TLS 协议设置
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls11 -bor [System.Net.SecurityProtocolType]::Tls
+[System.Net.ServicePointManager]::DefaultConnectionLimit = 8
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $LogFile = Join-Path $ScriptDir "update.log"
@@ -52,7 +55,13 @@ $UpdateScripts = @(
     'MaaEnd-全量更新-静默(beta).bat',
     'MaaEnd-全量更新-Debug(beta).bat',
     '使用前阅读此文件.txt',
-    'update.log'
+    'update.log',
+    # 隐藏目录和文件保护
+    '.update_temp',
+    '.update_backup',
+    '.update_state',
+    '.pwsh',
+    'cache'
 )
 
 $ApiBase = 'https://api.github.com/repos/MaaEnd/MaaEnd/releases'
@@ -157,7 +166,7 @@ function Start-Download {
                 return $true
             }
             catch {
-                Write-Warn "curl 失败: $($_.Exception.Message.Trim())"
+                Write-Warn "curl 失败"
                 Remove-Item -Force $OutFile -ErrorAction SilentlyContinue
             }
         }
@@ -183,7 +192,7 @@ function Start-Download {
             return $true
         }
         catch {
-            Write-Warn "WebClient 失败: $($_.Exception.Message.Trim())"
+            Write-Warn "WebClient 失败"
             Remove-Item -Force $OutFile -ErrorAction SilentlyContinue
         }
     }
@@ -191,8 +200,50 @@ function Start-Download {
     return $false
 }
 
+function New-Directory {
+    param([string]$Path, [switch]$Secure)
+    if (-not (Test-Path $Path)) {
+        $dir = New-Item -ItemType Directory -Path $Path -Force
+        if ($Secure) {
+            $acl = Get-Acl $Path
+            $acl.SetAccessRuleProtection($true, $false)
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+                "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"
+            )
+            $acl.SetAccessRule($rule)
+            Set-Acl -Path $Path -AclObject $acl
+        }
+        $dir | Out-Null
+    }
+}
+
+function Test-ZipPathSafety {
+    param([string]$ZipPath, [string]$DestDir)
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+        $destDirFull = [System.IO.Path]::GetFullPath($DestDir)
+        foreach ($entry in $zip.Entries) {
+            if ([string]::IsNullOrEmpty($entry.Name)) { continue }
+            $targetPath = [System.IO.Path]::Combine($destDirFull, $entry.FullName)
+            $targetPathFull = [System.IO.Path]::GetFullPath($targetPath)
+            if (-not $targetPathFull.StartsWith($destDirFull, [StringComparison]::OrdinalIgnoreCase)) {
+                $zip.Dispose()
+                return $false
+            }
+        }
+        $zip.Dispose()
+        return $true
+    }
+    catch { return $true }
+}
+
 function Expand-Zip {
     param([string]$ZipPath, [string]$DestDir)
+    if (-not (Test-ZipPathSafety -ZipPath $ZipPath -DestDir $DestDir)) {
+        throw "ZIP文件包含不安全路径，可能存在路径遍历攻击"
+    }
     try {
         Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
         [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $DestDir)
@@ -240,7 +291,7 @@ function Install-To-MaaEndDir {
 
     # 1. 备份保留目录
     $bakDir = Join-Path $env:TEMP "maaend_install_bak_$(Get-Random)"
-    New-Item -ItemType Directory -Path $bakDir -Force | Out-Null
+    New-Directory $bakDir -Secure
     foreach ($dir in $PreserveDirs) {
         $src = Join-Path $ScriptDir $dir
         if (Test-Path $src) { Copy-Item -Recurse $src (Join-Path $bakDir $dir) -Force }
@@ -253,19 +304,25 @@ function Install-To-MaaEndDir {
 
     # 3. 清理非白名单文件和目录
     Write-Info '清理旧文件...'
+    # 安全检查：防止删除当前脚本自身
+    $currentScript = $MyInvocation.MyCommand.Path
+    if ($currentScript) { $whitelist += (Split-Path $currentScript -Leaf) }
+
     Get-ChildItem $ScriptDir | ForEach-Object {
         if ($_.Name -in $whitelist) { return }
+        # 跳过隐藏文件/目录（额外保护）
+        if ($_.Attributes -band [IO.FileAttributes]::Hidden) { return }
         try {
             if ($_.PSIsContainer) { Remove-Item -Recurse -Force $_.FullName }
             else { Remove-Item -Force $_.FullName }
         }
-        catch { Write-Warn "删除失败: $($_.Name) - $_" }
+        catch { Write-Warn "删除失败: $($_.Name)" }
     }
 
     # 4. 解压到临时目录
     Write-Info '解压更新包...'
     $extractDir = Join-Path $env:TEMP "maaend_extract_$(Get-Random)"
-    New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+    New-Directory $extractDir -Secure
     Expand-Zip -ZipPath $ZipPath -DestDir $extractDir
 
     $entries = Get-ChildItem $extractDir
