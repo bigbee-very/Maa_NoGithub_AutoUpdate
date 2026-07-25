@@ -15,7 +15,8 @@ MaaEnd/
 
 # 构建输出
 bin/
-
+cache/
+.trae/
 # 子模块（独立仓库）
 MaaAssistantArknights/
 checksums.txt
@@ -23,3 +24,5 @@ release_notes.md
 Maa_NoGithub_Update.zip
 Maa_NoGithub_Update_V*.zip
 Maa_增量全量更新脚本/update_full.log
+Maa_增量全量更新脚本/update.log
+
