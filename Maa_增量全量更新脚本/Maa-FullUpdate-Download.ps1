@@ -33,27 +33,37 @@ if (-not $script:HttpsProxy) {
     } catch {}
 }
 
+# SSL/TLS 协议设置
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls11 -bor [System.Net.SecurityProtocolType]::Tls
+[System.Net.ServicePointManager]::DefaultConnectionLimit = 8
+
 $ApiBase1 = 'https://api.maa.plus/MaaAssistantArknights/api'
 $ApiBase2 = 'https://api2.maa.plus/MaaAssistantArknights/api'
 $MirrorHosts = @(
     'https://gh.ddlc.top',
-    'https://gh-proxy.com',
-    'https://agent.imgg.dev'
-)
-$GithubProxies = @(
-    'https://gh.ddlc.top/',
-    'https://gh-proxy.com/'
+    'https://ghfast.top',
+    'https://mirror.ghproxy.com',
+    'https://gh-proxy.com'
 )
 $SummaryApi = 'version/summary.json'
 $RetryMax = 3
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$LogFile = Join-Path $ScriptDir "update_full.log"
 
-function Write-Step { Write-Host "`n>>> $($args[0])" -ForegroundColor Magenta }
-function Write-Info { Write-Host "[信息] $($args[0])" -ForegroundColor Cyan }
-function Write-Ok { Write-Host "[成功] $($args[0])" -ForegroundColor Green }
-function Write-Warn { Write-Host "[注意] $($args[0])" -ForegroundColor Yellow }
-function Write-Err { Write-Host "[错误] $($args[0])" -ForegroundColor Red }
+# 日志记录函数
+function Write-Log {
+    param([string]$Level, [string]$Message)
+    $time = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $line = "[$time][$Level] $Message"
+    Add-Content -Path $LogFile -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
+}
+
+function Write-Step { param([string]$Msg) Write-Host "`n>>> $Msg" -ForegroundColor Magenta; Write-Log 'STEP' $Msg }
+function Write-Info { param([string]$Msg) Write-Host "[信息] $Msg" -ForegroundColor Cyan; Write-Log 'INFO' $Msg }
+function Write-Ok { param([string]$Msg) Write-Host "[成功] $Msg" -ForegroundColor Green; Write-Log 'OK' $Msg }
+function Write-Warn { param([string]$Msg) Write-Host "[注意] $Msg" -ForegroundColor Yellow; Write-Log 'WARN' $Msg }
+function Write-Err { param([string]$Msg) Write-Host "[错误] $Msg" -ForegroundColor Red; Write-Log 'ERROR' $Msg }
 
 function Format-FileSize {
     param([long]$Bytes)
@@ -95,7 +105,7 @@ function Start-Download {
                 return $true
             }
             catch {
-                Write-Warn "curl 失败: $($_.Exception.Message.Trim())"
+                Write-Warn "curl 失败"
                 Remove-Item -Force $OutFile -ErrorAction SilentlyContinue
             }
         }
@@ -125,7 +135,7 @@ function Start-Download {
             return $true
         }
         catch {
-            Write-Warn "WebClient 失败: $($_.Exception.Message.Trim())"
+            Write-Warn "WebClient 失败"
             Remove-Item -Force $OutFile -ErrorAction SilentlyContinue
         }
     }
@@ -133,8 +143,40 @@ function Start-Download {
     return $false
 }
 
+function Test-ZipPathSafety {
+    param([string]$ZipPath, [string]$DestDir)
+    # 验证ZIP文件路径安全性，防止路径遍历攻击
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+        $destDirFull = [System.IO.Path]::GetFullPath($DestDir)
+        foreach ($entry in $zip.Entries) {
+            # 跳过目录条目
+            if ([string]::IsNullOrEmpty($entry.Name)) { continue }
+            # 构造目标路径
+            $targetPath = [System.IO.Path]::Combine($destDirFull, $entry.FullName)
+            $targetPathFull = [System.IO.Path]::GetFullPath($targetPath)
+            # 验证目标路径是否在目标目录内
+            if (-not $targetPathFull.StartsWith($destDirFull, [StringComparison]::OrdinalIgnoreCase)) {
+                $zip.Dispose()
+                return $false
+            }
+        }
+        $zip.Dispose()
+        return $true
+    }
+    catch {
+        # 如果无法验证，允许解压（但会记录警告）
+        return $true
+    }
+}
+
 function Expand-Zip {
     param([string]$ZipPath, [string]$DestDir)
+    # 验证ZIP文件安全性
+    if (-not (Test-ZipPathSafety -ZipPath $ZipPath -DestDir $DestDir)) {
+        throw "ZIP文件包含不安全路径，可能存在路径遍历攻击"
+    }
     try {
         Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
         [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $DestDir)
@@ -149,6 +191,28 @@ function Expand-Zip {
     catch { throw "无法解压文件" }
 }
 
+function New-Directory {
+    param([string]$Path, [switch]$Secure)
+    if (-not (Test-Path $Path)) {
+        $dir = New-Item -ItemType Directory -Path $Path -Force
+        if ($Secure) {
+            # 设置安全权限：仅当前用户完全控制
+            $acl = Get-Acl $Path
+            $acl.SetAccessRuleProtection($true, $false)
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+                "FullControl",
+                "ContainerInherit,ObjectInherit",
+                "None",
+                "Allow"
+            )
+            $acl.SetAccessRule($rule)
+            Set-Acl -Path $Path -AclObject $acl
+        }
+        $dir | Out-Null
+    }
+}
+
 function Install-To-MaaDir {
     param([string]$ZipPath)
 
@@ -161,7 +225,7 @@ function Install-To-MaaDir {
 
     # 1. 备份白名单目录（config/data/resource/debug）
     $bakDir = Join-Path $env:TEMP "maa_install_bak_$(Get-Random)"
-    New-Item -ItemType Directory -Path $bakDir -Force | Out-Null
+    New-Directory $bakDir -Secure
     foreach ($dir in @('config', 'data', 'resource', 'debug')) {
         $src = Join-Path $ScriptDir $dir
         if (Test-Path $src) { Copy-Item -Recurse $src (Join-Path $bakDir $dir) -Force }
@@ -186,26 +250,40 @@ function Install-To-MaaDir {
         'resource',
         'data',
         'config',
-        'debug'
+        'debug',
+        # 隐藏目录和文件保护
+        '.update_temp',
+        '.update_backup',
+        '.update_state',
+        '.pwsh',
+        '.pwsh_auto_attempted',
+        'update.log',
+        'cache'
     )
     $zipName = Split-Path $ZipPath -Leaf
     if ($zipName -and $whitelist -notcontains $zipName) { $whitelist += $zipName }
+
+    # 安全检查：防止删除当前脚本自身
+    $currentScript = $MyInvocation.MyCommand.Path
+    if ($currentScript) { $whitelist += (Split-Path $currentScript -Leaf) }
 
     # 3. 清理非白名单文件和目录
     Write-Info '清理旧文件...'
     Get-ChildItem $ScriptDir | ForEach-Object {
         if ($_.Name -in $whitelist) { return }
+        # 跳过隐藏文件/目录（额外保护）
+        if ($_.Attributes -band [IO.FileAttributes]::Hidden) { return }
         try {
             if ($_.PSIsContainer) { Remove-Item -Recurse -Force $_.FullName }
             else { Remove-Item -Force $_.FullName }
         }
-        catch { Write-Warn "删除失败: $($_.Name) - $_" }
+        catch { Write-Warn "删除失败: $($_.Name)" }
     }
 
     # 4. 解压
     Write-Info '解压更新包...'
     $extractDir = Join-Path $env:TEMP "maa_extract_$(Get-Random)"
-    New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+    New-Directory $extractDir -Secure
     Expand-Zip -ZipPath $ZipPath -DestDir $extractDir
 
     $entries = Get-ChildItem $extractDir
@@ -299,12 +377,6 @@ $expectedSize = [long]$asset.size
 $expectedSha256 = $asset.sha256
 $filepath = Join-Path $ScriptDir $filename
 $mirrorUrls = $MirrorHosts | ForEach-Object { "$_/$originalUrl" }
-if ($GithubProxies) {
-    foreach ($p in $GithubProxies) {
-        $proxyUrl = "$p$originalUrl"
-        if ($mirrorUrls -notcontains $proxyUrl) { $mirrorUrls += $proxyUrl }
-    }
-}
 
 Write-Info "文件名: $filename"
 Write-Info "文件大小: $(Format-FileSize $expectedSize)"

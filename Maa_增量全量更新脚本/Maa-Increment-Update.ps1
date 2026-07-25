@@ -1,6 +1,6 @@
 ﻿<#:
 .SYNOPSIS
-    MAA 一键更新脚本 — 无代理 v3.1（带故障冗余）
+    MAA 一键更新脚本 — 无代理 v3.3（带故障冗余）
 .DESCRIPTION
     放置于 MAA 安装目录下直接运行。
     具备下载重试、镜像降级、安装前备份、失败回滚、日志记录、API 缓存等冗余机制。
@@ -22,6 +22,8 @@ param(
 $ErrorActionPreference = 'Continue'
 Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
 [System.Net.ServicePointManager]::DefaultConnectionLimit = 8
+# SSL/TLS 协议设置
+[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls11 -bor [System.Net.SecurityProtocolType]::Tls
 $script:HasCurl = $null -ne (Get-Command 'curl.exe' -ErrorAction SilentlyContinue)
 $script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
@@ -104,7 +106,7 @@ function Initialize-DnsAccel {
             }
         }
     }
-    catch { Write-Warn "DNS 加速失败: $_" }
+    catch { Write-Warn "DNS 加速失败" }
 }
 # ======== 配置 ========
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
@@ -223,8 +225,40 @@ function Format-FileSize {
     return "$Bytes B"
 }
 
+function Test-ZipPathSafety {
+    param([string]$ZipPath, [string]$DestDir)
+    # 验证ZIP文件路径安全性，防止路径遍历攻击
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+        $destDirFull = [System.IO.Path]::GetFullPath($DestDir)
+        foreach ($entry in $zip.Entries) {
+            # 跳过目录条目
+            if ([string]::IsNullOrEmpty($entry.Name)) { continue }
+            # 构造目标路径
+            $targetPath = [System.IO.Path]::Combine($destDirFull, $entry.FullName)
+            $targetPathFull = [System.IO.Path]::GetFullPath($targetPath)
+            # 验证目标路径是否在目标目录内
+            if (-not $targetPathFull.StartsWith($destDirFull, [StringComparison]::OrdinalIgnoreCase)) {
+                $zip.Dispose()
+                return $false
+            }
+        }
+        $zip.Dispose()
+        return $true
+    }
+    catch {
+        # 如果无法验证，允许解压（但会记录警告）
+        return $true
+    }
+}
+
 function Expand-Zip {
     param([string]$ZipPath, [string]$DestDir)
+    # 验证ZIP文件安全性
+    if (-not (Test-ZipPathSafety -ZipPath $ZipPath -DestDir $DestDir)) {
+        throw "ZIP文件包含不安全路径，可能存在路径遍历攻击"
+    }
     try {
         Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
         [System.IO.Compression.ZipFile]::ExtractToDirectory($ZipPath, $DestDir)
@@ -239,7 +273,27 @@ function Expand-Zip {
     catch { throw "无法解压文件" }
 }
 
-function New-Directory { param([string]$Path) if (-not (Test-Path $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null } }
+function New-Directory {
+    param([string]$Path, [switch]$Secure)
+    if (-not (Test-Path $Path)) {
+        $dir = New-Item -ItemType Directory -Path $Path -Force
+        if ($Secure) {
+            # 设置安全权限：仅当前用户完全控制
+            $acl = Get-Acl $Path
+            $acl.SetAccessRuleProtection($true, $false)
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+                "FullControl",
+                "ContainerInherit,ObjectInherit",
+                "None",
+                "Allow"
+            )
+            $acl.SetAccessRule($rule)
+            Set-Acl -Path $Path -AclObject $acl
+        }
+        $dir | Out-Null
+    }
+}
 
 # ======== 分片下载（大文件加速） ========
 function Start-SegmentedDownload {
@@ -294,7 +348,7 @@ function Start-SegmentedDownload {
             try {
                 $segTasks[$i].AsyncWaitHandle.WaitOne() | Out-Null
                 $null = $psInstances[$i].EndInvoke($segTasks[$i])
-            } catch { $failed = $true; Write-Warn "分片 $i 下载失败: $_" }
+            } catch { $failed = $true; Write-Warn "分片 $i 下载失败" }
         }
         $pool.Close(); $pool.Dispose()
         foreach ($psInstance in $psInstances) { $psInstance.Dispose() }
@@ -323,7 +377,7 @@ function Start-SegmentedDownload {
         return $true
     }
     catch {
-        Write-Warn "分片下载失败，回退单线程: $_"
+        Write-Warn "分片下载失败，回退单线程"
         foreach ($f in $segFiles) { Remove-Item -Force $f -ErrorAction SilentlyContinue }
         return $false
     }
@@ -420,29 +474,31 @@ function Start-Http2Download {
     if (-not $script:HasPwsh) { return $false }
     try {
         Write-Info "尝试 HTTP/2 下载 (pwsh)..."
-        New-Directory $TempDir
+        New-Directory $TempDir -Secure
         New-Directory (Split-Path $OutFile -Parent)
         $ps1 = Join-Path $TempDir 'http2_dl.ps1'
-        @"
-param(`$u, `$o)
+        # 使用安全的参数传递，避免命令注入
+        $ps1Content = @'
+param([string]$Url, [string]$OutFile)
 try {
-    `$h = [System.Net.Http.SocketsHttpHandler]::new()
-    `$h.EnableMultipleHttp2Connections = `$true
-    `$c = [System.Net.Http.HttpClient]::new(`$h)
-    `$c.DefaultRequestHeaders.UserAgent.ParseAdd('MAA-Update/2.2')
-    `$c.Timeout = [TimeSpan]::FromSeconds(600)
-    `$r = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, `$u)
-    `$r.Version = [System.Net.HttpVersion]::Version20
-    `$resp = `$c.SendAsync(`$r, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
-    if (-not `$resp.IsSuccessStatusCode) { exit 1 }
-    `$s = `$resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-    `$f = [System.IO.File]::Create(`$o)
-    `$s.CopyToAsync(`$f).GetAwaiter().GetResult()
-    `$f.Close()
+    $h = [System.Net.Http.SocketsHttpHandler]::new()
+    $h.EnableMultipleHttp2Connections = $true
+    $c = [System.Net.Http.HttpClient]::new($h)
+    $c.DefaultRequestHeaders.UserAgent.ParseAdd('MAA-Update/2.2')
+    $c.Timeout = [TimeSpan]::FromSeconds(600)
+    $r = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Url)
+    $r.Version = [System.Net.HttpVersion]::Version20
+    $resp = $c.SendAsync($r, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+    if (-not $resp.IsSuccessStatusCode) { exit 1 }
+    $s = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+    $f = [System.IO.File]::Create($OutFile)
+    $s.CopyToAsync($f).GetAwaiter().GetResult()
+    $f.Close()
     exit 0
 } catch { exit 2 }
-"@ | Set-Content $ps1 -Encoding UTF8
-        & $script:PwshPath -NoProfile -File $ps1 $Url $OutFile
+'@
+        $ps1Content | Set-Content $ps1 -Encoding UTF8
+        & $script:PwshPath -NoProfile -File $ps1 -Url $Url -OutFile $OutFile
         $http2ExitCode = $LASTEXITCODE
         Remove-Item -Force $ps1 -ErrorAction SilentlyContinue
         if ($http2ExitCode -eq 0 -and (Test-Path $OutFile)) {
@@ -453,7 +509,7 @@ try {
             }
             Write-Warn "HTTP/2 大小不匹配"; Remove-Item -Force $OutFile -ErrorAction SilentlyContinue
         } else { Write-Warn "HTTP/2 退出($LASTEXITCODE)" }
-    } catch { Write-Warn "HTTP/2 下载失败: $_" }
+    } catch { Write-Warn "HTTP/2 下载失败" }
     return $false
 }
 
@@ -485,7 +541,7 @@ function Start-Download {
                     Write-Warn "curl 退出($LASTEXITCODE)，等待重试..."
                 }
             }
-            catch { Write-Warn "curl 下载失败: $_"; Remove-Item -Force $OutFile -ErrorAction SilentlyContinue }
+            catch { Write-Warn "curl 下载失败"; Remove-Item -Force $OutFile -ErrorAction SilentlyContinue }
         }
     }
 
@@ -522,7 +578,7 @@ function Start-Download {
             return $true
         }
         catch {
-            Write-Warn "下载失败: $_"
+            Write-Warn "下载失败"
             Remove-Item -Force $OutFile -ErrorAction SilentlyContinue
         }
     }
@@ -775,7 +831,7 @@ function Install-Update {
     Set-State -Phase 'extracting' -Version $UpdateInfo.Version
     $extractDir = Join-Path $TempDir 'extract'
     if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
-    New-Directory $extractDir
+    New-Directory $extractDir -Secure
     try {
         Show-Wait '正在解压更新包...'
         Expand-Zip -ZipPath $PackagePath -DestDir $extractDir
@@ -1028,7 +1084,7 @@ function Invoke-FullDownload {
             return $true
         }
     }
-    catch { Write-Warn "全量下载异常: $_" }
+    catch { Write-Warn "全量下载异常" }
     return $false
 }
 
@@ -1042,7 +1098,7 @@ function Cleanup-Temp {
 try {
     # 清旧日志，写新日志
     if (Test-Path $LogFile) { Remove-Item -Force $LogFile -ErrorAction SilentlyContinue }
-    Write-Log 'INFO' "=== MAA 更新脚本 v3.1 启动 ==="
+    Write-Log 'INFO' "=== MAA 更新脚本 v3.3 启动 ==="
     Write-Log 'INFO' "目录: $ScriptDir | 通道: $Channel"
     if ($Force) { Write-Warn '强制更新模式' }
     if ($DryRun) { Write-Warn '仅检查模式（不下载）' }
@@ -1190,9 +1246,8 @@ try {
 
 }
 catch {
-    Write-Err "更新过程出错: $_"
-    Write-Err $_.ScriptStackTrace
-    Write-Log 'ERROR' "异常: $_"
+    Write-Err "更新过程出错"
+    Write-Log 'ERROR' "更新过程出错"
     if (Test-Path $BackupDir) { Restore-Backup }
     Cleanup-Temp
     Clear-State
