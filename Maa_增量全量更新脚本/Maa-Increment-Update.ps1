@@ -1,9 +1,16 @@
 ﻿<#:
 .SYNOPSIS
-    MAA 一键更新脚本 — 无代理 v3.3（带故障冗余）
+    MAA 一键更新脚本 — 无代理 v3.4（语义化版本 + 智能路由）
 .DESCRIPTION
     放置于 MAA 安装目录下直接运行。
-    具备下载重试、镜像降级、安装前备份、失败回滚、日志记录、API 缓存等冗余机制。
+    具备语义化版本比较、跨通道最新版解析、代理/直连智能路由、
+    下载重试、镜像降级、安装前备份、失败回滚、日志记录、API 缓存等冗余机制。
+.PARAMETER Channel
+    更新通道: stable / beta / alpha。beta 会同时比较 beta 与 stable，取语义化版本最新者。
+.PARAMETER Force
+    强制更新（忽略版本/资源时间比较）。
+.PARAMETER SelfTest
+    仅运行内置纯函数自测，不进行任何网络或文件操作。
 .AUTHOR
     bigbee
 .PROJECT
@@ -16,7 +23,8 @@ param(
     [switch]$Force,
     [switch]$SkipVersion,
     [switch]$SkipResource,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$SelfTest
 )
 
 $ErrorActionPreference = 'Continue'
@@ -31,23 +39,507 @@ $ProgressPreference = 'SilentlyContinue'
 $script:HttpsProxy = ''
 if ($env:HTTPS_PROXY) { $script:HttpsProxy = $env:HTTPS_PROXY } elseif ($env:HTTP_PROXY) { $script:HttpsProxy = $env:HTTP_PROXY }
 
-function Detect-SystemProxy {
-    if ($script:HttpsProxy) {
-        $script:SysProxy = $script:HttpsProxy
-        Write-Info "检测到环境变量代理: $($script:SysProxy)"
-        return
+# ======== 代理探测 ========
+# 返回 @{ Url = <可用地址>; ForCurl = <curl 参数值>; DotNet = <WebProxy 地址或 $null>; Socks = <bool> }
+# 说明：
+#   - SOCKS5 代理无法交给 .NET WebProxy 使用，此时 DotNet 返回 $null，由 curl 接管。
+#   - 部分代理客户端（如 Clash）会设置 HTTPS_PROXY=socks5://127.0.0.1:7897，
+#     这种地址直接塞给 System.Net.WebProxy 会抛异常并绕过代理，故单独处理。
+function Resolve-ProxyConfig {
+    param([string]$RawValue)
+    $cfg = @{ Url = ''; ForCurl = $null; DotNet = $null; Socks = $false }
+    $raw = ''
+    if ($RawValue) { $raw = ([string]$RawValue).Trim() }
+    if (-not $raw) { return $cfg }
+
+    # 形如 "http=127.0.0.1:7897;https=127.0.0.1:7897" 的按协议代理列表
+    if ($raw -match '=' -and $raw -match ';|=') {
+        foreach ($part in ($raw -split ';')) {
+            $kv = $part -split '=', 2
+            if ($kv.Count -eq 2 -and $kv[0].Trim() -in @('https', 'http')) {
+                $raw = $kv[1].Trim()
+                if ($kv[0].Trim() -eq 'https') { break }
+            }
+        }
+        if ($raw -match '=') { return $cfg }
     }
-    try {
-        $regPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
-        $proxyEnabled = (Get-ItemProperty -Path $regPath -Name 'ProxyEnable' -ErrorAction SilentlyContinue).ProxyEnable
-        $proxyServer = (Get-ItemProperty -Path $regPath -Name 'ProxyServer' -ErrorAction SilentlyContinue).ProxyServer
-        if ($proxyEnabled -and $proxyServer) { $script:SysProxy = "http://$proxyServer"; Write-Info "检测到系统代理: $($script:SysProxy)"; return }
-    } catch {}
-    $script:SysProxy = $script:HttpsProxy
-    if ($script:SysProxy) { Write-Info "检测到环境变量代理: $($script:SysProxy)" }
+    if ($raw -notmatch '://') { $raw = "http://$raw" }
+
+    $isSocks = $raw -match '^(socks4|socks4a|socks5|socks5h)://'
+    if ($isSocks) {
+        $cfg.Socks = $true
+        $cfg.Url = $raw
+        $cfg.ForCurl = $raw                                                        # curl 原生支持 socks5h://
+        $cfg.DotNet = $null                                                        # .NET WebProxy 不支持
+        return $cfg
+    }
+
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($raw, [System.UriKind]::Absolute, [ref]$uri)) { return $cfg }
+    $norm = "$($uri.Scheme)://$($uri.Host)"
+    if (-not $uri.IsDefaultPort) { $norm += ":$($uri.Port)" }
+    $cfg.Url = $norm
+    $cfg.ForCurl = $norm
+    $cfg.DotNet = $norm
+    return $cfg
 }
 
-# ======== DNS 加速（中国 DNS 解析 + 测速 + hosts/curl-resolve） ========
+function Detect-SystemProxy {
+    $raw = ''
+    $source = ''
+    if ($env:HTTPS_PROXY) { $raw = $env:HTTPS_PROXY; $source = '环境变量 HTTPS_PROXY' }
+    elseif ($env:HTTP_PROXY) { $raw = $env:HTTP_PROXY; $source = '环境变量 HTTP_PROXY' }
+    if (-not $raw) {
+        try {
+            $regPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+            $proxyEnabled = (Get-ItemProperty -Path $regPath -Name 'ProxyEnable' -ErrorAction SilentlyContinue).ProxyEnable
+            $proxyServer = (Get-ItemProperty -Path $regPath -Name 'ProxyServer' -ErrorAction SilentlyContinue).ProxyServer
+            if ($proxyEnabled -and $proxyServer) { $raw = [string]$proxyServer; $source = '系统代理 (IE 设置)' }
+        }
+        catch {}
+    }
+    $script:ProxyConfig = Resolve-ProxyConfig $raw
+    $script:SysProxy = $script:ProxyConfig.Url
+    if ($script:SysProxy) {
+        Write-Info "检测到代理[$source]: $($script:SysProxy)"
+        if ($script:ProxyConfig.Socks) { Write-Info 'SOCKS 代理：仅 curl 支持，其它引擎将走直连' }
+    }
+    else { Write-Info '未检测到代理，将使用直连/镜像' }
+}
+
+# ======== 语义化版本比较 ========
+# 支持 v6.19.2 / 6.19.2-beta.2 / v6.18.0-beta.1.d014.g313c9b460c1 / 6.19.1-alpha.1.d096.gf94342d3e2
+# 规则遵循 SemVer：正式版 > 预发布版（6.19.2 > 6.19.2-beta.2）
+function ConvertTo-VersionParts {
+    param([string]$Version)
+    $v = ([string]$Version).Trim()
+    if (-not $v) { return $null }
+    if ($v.StartsWith('v') -or $v.StartsWith('V')) { $v = $v.Substring(1) }
+    $v = ($v -split '\+')[0]                      # 丢弃 build metadata
+    $v = $v.Trim()
+
+    $pre = ''
+    # 主版本号统一为「数字.数字[.数字]」；预发布部分用 - 或 _ 分隔。
+    # 注意匹配后要检查左边界：'6.19.1-alpha.1' 应切成 6.19.1 + alpha.1，
+    # 而 '6.18.0-beta.1.d014' 应切成 6.18.0 + beta.1.d014
+    # （'-' 后面的 alpha.1 属于预发布串，不能再被当成主版本号）。
+    if ($v -match '^([0-9]+(?:\.[0-9]+)*?)[\-_](.+)$') { $v = $matches[1]; $pre = $matches[2] }
+    $nums = @()
+    $segs = @()
+    foreach ($p in ($v -split '\.')) {
+        if ($p -match '^\d+$') {
+            $segs += $p
+            $nums += [int]$p
+        }
+        else { $segs += $p }
+    }
+    if ($nums.Count -eq 0) { return $null }
+    while ($nums.Count -lt 3) { $nums += 0 }
+
+    $preIds = @()
+    foreach ($p in ($pre -split '[\.\-_]')) {
+        if (-not $p) { continue }
+        if ($p -match '^\d+$') { $preIds += , @([int]$p, $true) }
+        else { $preIds += , @([string]$p, $false) }
+    }
+    return @{
+        Major   = $nums[0]
+        Minor   = $nums[1]
+        Patch   = $nums[2]
+        Extra   = @($nums[3..($nums.Count - 1)])
+        Pre     = $pre
+        PreIds  = $preIds
+        Segs    = @($segs[0..([Math]::Min(2, $segs.Count - 1))])
+        Raw     = ([string]$Version).Trim()
+    }
+}
+
+# 语义化版本排序键：把版本号压成可直接做字符串比较的定长键。
+# 规则（遵循 SemVer）：
+#   - 主/次/修订号各自零填充到 6 位，保证数值序等于字符串序
+#   - 正式版在预发布段前加 '~'，预发布版加 '!'，因为 '~'(0x7E) > '!'(0x21)
+#   - 预发布标识之间用 '|' 连接：标识更少者（alpha.1）排在更多者（alpha.1.d096）之前
+#   - 数字标识零填充，保证 beta.10 > beta.9
+#   - 数字标识 < 字母标识（SemVer 规定）
+function Get-VersionKey {
+    param([string]$Version)
+    $v = ([string]$Version).Trim()
+    if (-not $v) { return '' }
+    if ($v.StartsWith('v') -or $v.StartsWith('V')) { $v = $v.Substring(1) }
+    if ($v.Contains('+')) { $v = $v.Split('+')[0] }
+    $v = $v.Trim()
+    if (-not $v) { return '' }
+
+    $pre = ''
+    if ($v.Contains('-')) {
+        $idx = $v.IndexOf('-')
+        $pre = $v.Substring($idx + 1)
+        $v = $v.Substring(0, $idx)
+    }
+    if ($v.Contains('_')) {
+        $idx = $v.IndexOf('_')
+        if (-not $pre) { $pre = $v.Substring($idx + 1) }
+        $v = $v.Substring(0, $idx)
+    }
+    $v = $v.Trim()
+    if (-not $v) { return '' }
+
+    $parts = @($v.Split('.') | Where-Object { $_ -ne '' })
+    if ($parts.Count -eq 0) { return '' }
+    $nums = @()
+    foreach ($q in $parts) {
+        if (-not ($q -match '^\d+$')) { return '' }      # 数字段里混入非数字 → 无法解析
+        $nums += [int]$q
+    }
+    while ($nums.Count -lt 3) { $nums += 0 }
+
+    $key = '{0:D6}.{1:D6}.{2:D6}' -f $nums[0], $nums[1], $nums[2]
+    if (-not $pre) { return $key + '.~' }
+    $pre = $pre.ToLowerInvariant()
+    $ids = New-Object System.Collections.Generic.List[string]
+    foreach ($id in ($pre -split '[\.\-_]')) {
+        if (-not $id) { continue }
+        if ($id -match '^\d+$') {
+            $n = $id
+            if ($n.Length -gt 9) { $n = $n.Substring($n.Length - 9) }
+            $ids.Add('0' + $n.PadLeft(9, '0'))
+        }
+        else { $ids.Add('1' + $id) }
+    }
+    if ($ids.Count -eq 0) { return $key + '.~' }
+    # 末尾加终止符 '~'(0x7E)：标识更少的版本（alpha.1）大于同前缀的夜间版（alpha.1.d014）
+    return $key + '.!' + ($ids -join '|') + '~'
+}
+
+# 语义化版本比较（A > B 返回 1，A < B 返回 -1，相等返回 0）
+function Compare-SemVer {
+    param([string]$VersionA, [string]$VersionB)
+    $ka = Get-VersionKey $VersionA
+    $kb = Get-VersionKey $VersionB
+    if (-not $ka -and -not $kb) { return 0 }
+    if (-not $ka) { return -1 }
+    if (-not $kb) { return 1 }
+    $c = [string]::CompareOrdinal($ka, $kb)
+    if ($c -gt 0) { return 1 }
+    if ($c -lt 0) { return -1 }
+    return 0
+}
+
+# 人工核对的排序键（与 Get-VersionKey 同一套规则）
+function ConvertTo-VersionComparable {
+    param([string]$Version)
+    return (Get-VersionKey $Version)
+}
+
+# 按语义化版本降序排列（插入排序；比较结果先落盘到变量，避免复合条件里的隐式行为）
+function Sort-VersionDescending {
+    param([string[]]$Versions)
+    $arr = @()
+    foreach ($v in $Versions) {
+        if (-not $v) { continue }
+        if ($arr -notcontains $v) { $arr += $v }
+    }
+    $n = $arr.Count
+    for ($i = 1; $i -lt $n; $i++) {
+        $key = $arr[$i]
+        $j = $i - 1
+        $cmp = 0
+        if ($j -ge 0) { $cmp = Compare-SemVer ($arr[$j]) ($key) }
+        while ($j -ge 0 -and $cmp -lt 0) {
+            $arr[$j + 1] = $arr[$j]
+            $j = $j - 1
+            if ($j -ge 0) { $cmp = Compare-SemVer ($arr[$j]) ($key) }
+        }
+        $arr[$j + 1] = $key
+    }
+    return @($arr)
+}
+
+function Select-BestVersion {
+    param([string[]]$Versions)
+    $best = ''
+    foreach ($v in $Versions) {
+        if (-not $v) { continue }
+        if (-not $best) { $best = $v; continue }
+        if ((Compare-SemVer $v $best) -gt 0) { $best = $v }
+    }
+    return $best
+}
+
+function Get-VersionBase {
+    param([string]$Version)
+    $p = ConvertTo-VersionParts $Version
+    if (-not $p) { return '' }
+    $seg = @($p.Segs)
+    return (@($seg[0], $seg[1], $seg[2]) -join '.')
+}
+
+# ======== 版本比较自测（-SelfTest） ========
+function Test-ScriptLogic {
+    $script:fail = 0
+    function Assert-Same {
+        param([string]$Name, $Expected, $Actual)
+        if ($Expected -eq $Actual) { Write-Host "  [通过] $Name" -ForegroundColor Green }
+        else { Write-Host "  [失败] $Name`n         期望: $Expected`n         实际: $Actual" -ForegroundColor Red; $script:fail = $script:fail + 1 }
+    }
+
+    Write-Host '--- Compare-SemVer ---' -ForegroundColor Cyan
+    Assert-Same 'beta2 < 正式版' (-1) (Compare-SemVer 'v6.19.2-beta.2' 'v6.19.2')
+    Assert-Same '正式版 > beta2' 1 (Compare-SemVer 'v6.19.2' 'v6.19.2-beta.2')
+    Assert-Same 'beta2 > beta1' 1 (Compare-SemVer 'v6.19.2-beta.2' 'v6.19.2-beta.1')
+    Assert-Same 'beta10 > beta9' 1 (Compare-SemVer 'v6.19.2-beta.10' 'v6.19.2-beta.9')
+    Assert-Same '相等（带v）' 0 (Compare-SemVer 'v6.19.0' '6.19.0')
+    Assert-Same '补零相等' 0 (Compare-SemVer '6.19' 'v6.19.0')
+    Assert-Same 'patch 递增' 1 (Compare-SemVer '6.19.10' '6.19.9')
+    Assert-Same 'minor 递增' 1 (Compare-SemVer '6.20.0' '6.19.99')
+    Assert-Same '夜间版后缀：beta.1 > beta.1.d014' 1 (Compare-SemVer 'v6.18.0-beta.1' 'v6.18.0-beta.1.d014.g313c9b460c1')
+    Assert-Same 'alpha.1 > alpha.1.d096' 1 (Compare-SemVer 'v6.19.1-alpha.1' 'v6.19.1-alpha.1.d096.gf94342d3e2')
+    Assert-Same 'alpha < 正式版' (-1) (Compare-SemVer 'v6.19.0-alpha.2' 'v6.19.0')
+    Assert-Same '数字段序正确 (非字符串比较)' (-1) (Compare-SemVer 'v6.9.0' 'v6.10.0')
+
+    Write-Host '--- Select-BestVersion ---' -ForegroundColor Cyan
+    Assert-Same 'beta 通道取较新正式版' 'v6.19.2' (Select-BestVersion @('v6.19.0', 'v6.19.2'))
+    Assert-Same 'beta 通道取较新公测版' 'v6.19.3-beta.1' (Select-BestVersion @('v6.19.2', 'v6.19.3-beta.1'))
+    Assert-Same '空列表' '' (Select-BestVersion @())
+
+    Write-Host '--- Get-VersionKey / Sort-VersionDescending ---' -ForegroundColor Cyan
+    Assert-Same '版本切分：alpha.1 归属预发布' '6.19.1|alpha.1' ((ConvertTo-VersionParts 'v6.19.1-alpha.1') | ForEach-Object { "$(@($_.Segs) -join '.')|$($_.Pre)" })
+    Assert-Same '排序键（正式版）' '000006.000019.000002.~' (Get-VersionKey 'v6.19.2')
+    Assert-Same '排序键（预发布低于正式版）' $true ((Get-VersionKey 'v6.19.2-beta.2') -lt (Get-VersionKey 'v6.19.2'))
+    Assert-Same '排序键（beta.10 > beta.9）' $true ((Get-VersionKey 'v6.19.2-beta.10') -gt (Get-VersionKey 'v6.19.2-beta.9'))
+    Assert-Same 'Get-VersionBase' '6.19.0' (Get-VersionBase 'v6.19.0-beta.1.d014.g313c9b460c1')
+    Assert-Same '降序（正式版优先于预发布）' 'v6.19.2,v6.19.2-beta.2,v6.19.0' ((Sort-VersionDescending @('v6.19.0', 'v6.19.2-beta.2', 'v6.19.2')) -join ',')
+    Assert-Same '比较结果是标量' 'Int32' (Compare-SemVer 'v6.19.2' 'v6.19.2').GetType().Name
+    Assert-Same 'compare(alpha.1, 夜间版)' 1 (Compare-SemVer 'v6.19.1-alpha.1' 'v6.19.1-alpha.1.d096.gf94342d3e2')
+    Assert-Same '降序（跨多段跨通道）' 'v6.19.2,v6.19.2-beta.2,v6.19.1-alpha.1,v6.19.1-alpha.1.d096.gf94342d3e2,v6.18.9' ((Sort-VersionDescending @('v6.18.9', 'v6.19.1-alpha.1.d096.gf94342d3e2', 'v6.19.1-alpha.1', 'v6.19.2-beta.2', 'v6.19.2')) -join ',')
+    Assert-Same '降序（首位即最新）' 'v6.19.2' (@(Sort-VersionDescending @('v6.19.0', 'v6.19.2', 'v6.18.9'))[0])
+
+    Write-Host '--- Resolve-ProxyConfig ---' -ForegroundColor Cyan
+    Assert-Same 'http 代理' 'http://127.0.0.1:7897' (Resolve-ProxyConfig '127.0.0.1:7897').Url
+    Assert-Same 'http 代理(带 scheme)' 'http://127.0.0.1:7897' (Resolve-ProxyConfig 'http://127.0.0.1:7897').Url
+    Assert-Same 'socks5 标记' $true (Resolve-ProxyConfig 'socks5://127.0.0.1:7897').Socks
+    Assert-Same 'socks5 的 .NET 代理为空' $null (Resolve-ProxyConfig 'socks5://127.0.0.1:7897').DotNet
+    Assert-Same 'socks5 交给 curl' 'socks5://127.0.0.1:7897' (Resolve-ProxyConfig 'socks5://127.0.0.1:7897').ForCurl
+    Assert-Same '按协议列表取值' 'http://127.0.0.1:7897' (Resolve-ProxyConfig 'http=127.0.0.1:7897;https=127.0.0.1:7897').Url
+    Assert-Same '空值' '' (Resolve-ProxyConfig '').Url
+
+    Write-Host '--- Test-DownloadSpeed -Ms 探测 ---' -ForegroundColor Cyan
+    $t0 = Get-Date
+    $msNoSwitch = Test-DownloadSpeed -Url 'https://api.maa.plus/MaaAssistantArknights/api/version/summary.json' -TimeoutSec 8 -TestBytes 1KB
+    $msWithSwitch = Test-DownloadSpeed -Url 'https://api.maa.plus/MaaAssistantArknights/api/version/summary.json' -TimeoutSec 8 -TestBytes 1KB -Ms
+    Write-Host ("    无 -Ms: 类型={0} 值={1}" -f $msNoSwitch.GetType().Name, ($msNoSwitch | Out-String).Trim())
+    Write-Host ("    带 -Ms: 类型={0} 值={1}" -f $msWithSwitch.GetType().Name, ($msWithSwitch | Out-String).Trim())
+    Assert-Same '不带 -Ms 返回哈希表' 'Hashtable' $msNoSwitch.GetType().Name
+    Assert-Same '带 -Ms 返回标量毫秒' $true ($msWithSwitch.GetType().Name -in @('Int32', 'Int64', 'Double'))
+    Write-Host '--- Parse-GithubAssetName ---' -ForegroundColor Cyan
+    $a = Parse-GithubAssetName 'MAAComponent-OTA-v6.16.0_v6.19.0-win-x64.zip'
+    Assert-Same 'OTA 识别' $true $a.IsOta
+    Assert-Same 'OTA 源版本' 'v6.16.0' $a.FromVersion
+    Assert-Same 'OTA 目标版本' 'v6.19.0' $a.ToVersion
+    Assert-Same 'OTA 架构' 'x64' $a.Arch
+    $b = Parse-GithubAssetName 'MAA-v6.19.0-win-x64.zip'
+    Assert-Same '完整包识别' $false $b.IsOta
+    Assert-Same '完整包版本' 'v6.19.0' $b.Version
+    Assert-Same '完整包架构' 'x64' $b.Arch
+    $c = Parse-GithubAssetName 'MAA-v6.19.0-win-arm64.zip'
+    Assert-Same 'arm64 识别' 'arm64' $c.Arch
+    Assert-Same 'arm64 不是 x64' $false ($c.Arch -eq 'x64')
+
+    # ---------- 跨通道最新版解析 & 更新包选择（模拟 API，不联网） ----------
+    Write-Host '--- Resolve-MaaRelease / Select-MaaAsset（离线模拟） ---' -ForegroundColor Cyan
+    $script:MockJson = @{}
+    function Invoke-GetJson { param([string]$Url, [int]$TimeoutSec = 15, [string]$Proxy = '') if ($script:MockJson.ContainsKey($Url)) { return $script:MockJson[$Url] } return $null }
+    function New-MockAsset {
+        param([string]$Base, [string[]]$Names, [string]$Tag)
+        $list = New-Object System.Collections.Generic.List[object]
+        foreach ($n in $Names) {
+            $list.Add([pscustomobject]@{ name = $n; size = 1000000; sha256 = 'deadbeef'; browser_download_url = "$Base/releases/download/$Tag/$n" })
+        }
+        return $list
+    }
+    $mockBase = 'https://github.com/MaaAssistantArknights/MaaRelease'
+    $script:MockJson["$MaaApiBase/$SummaryApi"] = [pscustomobject]@{
+        stable = [pscustomobject]@{ version = 'v6.19.2'; detail = "$MaaApiBase/version/stable.json" }
+        beta   = [pscustomobject]@{ version = 'v6.19.2-beta.2'; detail = "$MaaApiBase/version/beta.json" }
+        alpha  = [pscustomobject]@{ version = 'v6.19.3-alpha.1'; detail = "$MaaApiBase/version/alpha.json" }
+    }
+    $stableNames = @('MAA-v6.19.2-win-x64.zip', 'MAA-v6.19.2-win-arm64.zip',
+        'MAAComponent-OTA-v6.19.0_v6.19.2-win-x64.zip', 'MAAComponent-OTA-v6.19.0-beta.1_v6.19.2-win-x64.zip',
+        'MAAComponent-OTA-v6.19.2-beta.1_v6.19.2-win-x64.zip', 'MAAComponent-OTA-v6.19.2-beta.2_v6.19.2-win-x64.zip',
+        'MAAComponent-OTA-v6.19.2-beta.2.d010.ga7ee2c2bf7_v6.19.2-win-x64.zip', 'MAAComponent-OTA-v6.19.2-beta.2.d050.gb93089d920_v6.19.2-win-x64.zip')
+    $betaNames = @('MAA-v6.19.2-beta.2-win-x64.zip',
+        'MAAComponent-OTA-v6.19.2-beta.1_v6.19.2-beta.2-win-x64.zip',
+        'MAAComponent-OTA-v6.19.2-beta.2_v6.19.2-beta.2-win-x64.zip')
+    foreach ($u in @("$MaaApiBase/version/stable.json", "$MaaApiBase/version/beta.json")) {
+        $ch = if ($u -like '*beta*') { 'beta' } else { 'stable' }
+        $tag = if ($ch -eq 'beta') { 'v6.19.2-beta.2' } else { 'v6.19.2' }
+        $names = if ($ch -eq 'beta') { $betaNames } else { $stableNames }
+        $script:MockJson[$u] = [pscustomobject]@{ version = $tag; details = [pscustomobject]@{ tag_name = $tag; assets = (New-MockAsset $mockBase $names $tag) } }
+    }
+    $script:MockJson["$MaaApiBase/version/alpha.json"] = [pscustomobject]@{ version = 'v6.19.3-alpha.1'; details = [pscustomobject]@{ tag_name = 'v6.19.3-alpha.1'; assets = (New-MockAsset $mockBase @('MAA-v6.19.3-alpha.1-win-x64.zip') 'v6.19.3-alpha.1') } }
+
+    $relBeta = Resolve-MaaRelease -RequestedChannel 'beta'
+    Assert-Same '跨通道：beta 取到更新的正式版' 'v6.19.2' $relBeta.Version
+    Assert-Same '跨通道：来源通道为 stable' 'stable' $relBeta.Channel
+    $relAlpha = Resolve-MaaRelease -RequestedChannel 'alpha'
+    Assert-Same '跨通道：alpha 取到自己的最新版' 'v6.19.3-alpha.1' $relAlpha.Version
+
+    $info = Select-MaaAsset -Release $relBeta -CurrentVersion 'v6.19.2-beta.1' -Arch 'x64'
+    Assert-Same 'beta.1 → 6.19.2 用 OTA' 'OTA' $info.Type
+    Assert-Same 'beta.1 → 6.19.2 OTA 源版本' 'v6.19.2-beta.1' $info.OtaFrom
+    Assert-Same 'beta.1 → 6.19.2 OTA 目标版本' 'v6.19.2' $info.OtaTarget
+
+    $info2 = Select-MaaAsset -Release $relBeta -CurrentVersion 'v6.19.2-beta.2' -Arch 'x64'
+    Assert-Same 'beta.2 → 6.19.2 精确匹配 OTA' 'v6.19.2-beta.2' $info2.OtaFrom
+
+    $info3 = Select-MaaAsset -Release $relBeta -CurrentVersion 'v6.19.2-beta.2.d010.ga7ee2c2bf7' -Arch 'x64'
+    # 夜间版全名精确命中同名 OTA 时直接用该 OTA（文件差异最小）
+    Assert-Same '夜间版 → 6.19.2 精确命中同名夜间版 OTA' 'v6.19.2-beta.2.d010.ga7ee2c2bf7' $info3.OtaFrom
+
+    $info4 = Select-MaaAsset -Release $relBeta -CurrentVersion 'v6.10.7' -Arch 'x64'
+    Assert-Same '过旧版本 → 回退完整包' '完整包' $info4.Type
+    Assert-Same '完整包版本' 'v6.19.2' (Parse-GithubAssetName ([string]$info4.Asset.name)).Version
+
+    $info5 = Select-MaaAsset -Release $relBeta -CurrentVersion 'v6.19.3' -Arch 'x64'
+    Assert-Same '高于全部 OTA 源版本 → 取源版本最高者' 'v6.19.2-beta.2' $info5.OtaFrom
+
+    $infoArm = Select-MaaAsset -Release $relBeta -CurrentVersion 'v6.19.2-beta.2' -Arch 'arm64'
+    Assert-Same 'arm64 回退完整包' '完整包' $infoArm.Type
+    Assert-Same 'arm64 完整包文件名' 'MAA-v6.19.2-win-arm64.zip' ([string]$infoArm.Asset.name)
+
+    $cand = Get-DownloadCandidates -Url $mockBase
+    Assert-Same '候选数：直连1+镜像N' (1 + $MirrorHosts.Count) (1 + $cand.Mirrors.Count)
+    Assert-Same '镜像 URL 前缀正确' $true ([string]$cand.Mirrors[0]).StartsWith('http')
+
+    # ---------- 用户报告的核心场景：6.19.2-beta.2 → 6.19.2 ----------
+    Write-Host '--- 核心场景：beta.2 用户能否更新到正式版 6.19.2 ---' -ForegroundColor Cyan
+    $relBeta2 = Resolve-MaaRelease -RequestedChannel 'beta'
+    $fixInfo = Select-MaaAsset -Release $relBeta2 -CurrentVersion 'v6.19.2-beta.2' -Arch 'x64'
+    Assert-Same 'beta.2 → 6.19.2 不误报已是最新' $true ((Compare-SemVer $relBeta2.Version 'v6.19.2-beta.2') -gt 0)
+    Assert-Same 'beta.2 → 6.19.2 选中目标版本' 'v6.19.2' $fixInfo.Version
+    Assert-Same 'beta.2 → 6.19.2 使用 OTA' 'OTA' $fixInfo.Type
+    Assert-Same 'beta.2 → 6.19.2 OTA 文件名' 'MAAComponent-OTA-v6.19.2-beta.2_v6.19.2-win-x64.zip' ([string]$fixInfo.Asset.name)
+    # ---------- 资源包候选地址 ----------
+    $script:MockJson['https://cdn.jsdelivr.net/gh/MaaAssistantArknights/MaaResource@main/resource/version.json'] = [pscustomobject]@{ last_updated = '2026-08-23 01:57:24.000' }
+    $rt = Get-RemoteResourceTime
+    Assert-Same '远程资源版本可解析' '2026-08-23 01:57:24' $rt.ToString('yyyy-MM-dd HH:mm:ss')
+    Assert-Same '资源时间戳比较：新资源需要更新' $true ($rt -gt (ConvertTo-ResourceTime '2026-08-20 15:52:45'))
+
+    # ---------- 资源 URL 构造（防止变量名丢失导致 URL 为空） ----------
+    Assert-Same '资源仓库变量已定义' 'MaaAssistantArknights/MaaResource' $ResourceRepo
+    Assert-Same '资源版本 URL 完整' 'https://raw.githubusercontent.com/MaaAssistantArknights/MaaResource/main/resource/version.json' $ResourceVersionUrl
+    Assert-Same '资源 CDN URL 完整' 'https://cdn.jsdelivr.net/gh/MaaAssistantArknights/MaaResource@main/resource/version.json' $ResVersionCdnUrl
+    Assert-Same '资源归档 URL 完整' 'https://github.com/MaaAssistantArknights/MaaResource/archive/refs/heads/main.zip' $ResourceArchiveUrl
+    Assert-Same '镜像拼接后 URL 合法' $true ([string]$MirrorHosts[0]).TrimEnd('/').Length -gt 0
+    Assert-Same '镜像拼接无缺斜杠' $true ("$($MirrorHosts[0].TrimEnd('/'))/$ResourceVersionUrl") -eq "https://gh-proxy.com/$ResourceVersionUrl"
+    # ---------- 资源时间戳解析 ----------
+    Assert-Same '资源时间戳（.fff）' '2026-08-23 01:57:24' ((ConvertTo-ResourceTime '2026-08-23 01:57:24.000').ToString('yyyy-MM-dd HH:mm:ss'))
+    Assert-Same '资源时间戳（无 .fff）' '2026-08-23 01:57:24' ((ConvertTo-ResourceTime '2026-08-23 01:57:24').ToString('yyyy-MM-dd HH:mm:ss'))
+    Assert-Same '资源时间戳（T 分隔）' '2026-08-23 01:57:24' ((ConvertTo-ResourceTime '2026-08-23T01:57:24.000').ToString('yyyy-MM-dd HH:mm:ss'))
+    Assert-Same '资源时间戳（无效值）' $null (ConvertTo-ResourceTime 'not-a-date')
+    Write-Host ''
+    if ($script:fail -eq 0) { Write-Host '自测全部通过 ✔' -ForegroundColor Green; return $true }
+    Write-Host "自测失败 $($script:fail) 项 ✘" -ForegroundColor Red
+    return $false
+}
+
+# ======== 发布包文件名解析 ========
+function Parse-GithubAssetName {
+    param([string]$Name)
+    $r = @{ IsOta = $false; Arch = ''; Version = ''; FromVersion = ''; ToVersion = ''; BaseVersion = ''; Name = ([string]$Name) }
+    if (-not $Name) { return $r }
+    $n = [string]$Name
+
+    # 完整包: MAA-v6.19.0-win-x64.zip / MAA-v6.17.0-beta.5-win-x64.zip
+    if ($n -match '^MAA-(v[\d\.]+(?:-[0-9A-Za-z\.]+)?)-win-(x64|arm64)\.zip$') {
+        $r.Version = $matches[1]
+        $r.Arch = $matches[2]
+        $r.BaseVersion = Get-VersionBase $matches[1]
+        return $r
+    }
+    # OTA 增量包: MAAComponent-OTA-v6.16.0_v6.19.0-win-x64.zip
+    if ($n -match '^MAAComponent-OTA-(v[\d\.]+(?:-[0-9A-Za-z\.]+)?)_(v[\d\.]+(?:-[0-9A-Za-z\.]+)?)-win-(x64|arm64)\.zip$') {
+        $r.IsOta = $true
+        $r.FromVersion = $matches[1]
+        $r.ToVersion = $matches[2]
+        $r.Arch = $matches[3]
+        $r.Version = $matches[2]
+        $r.BaseVersion = Get-VersionBase $matches[2]
+        return $r
+    }
+    return $r
+}
+
+# ======== 下载候选地址（镜像 / 代理 / 直连） ========
+# 返回 @{ Direct = <# 不经过代理，直达 GitHub>; Proxied = <# 经过代理>; Mirrors = <# 公共镜像> }
+function Get-DownloadCandidates {
+    param([string]$Url)
+    # 镜像站尾部可能带 '/'，先归一化再拼接，避免出现 'https://host//https://...'
+    $clean = @()
+    foreach ($m in $MirrorHosts) { $clean += $m.TrimEnd('/') }
+    return @{
+        Direct  = $Url
+        Proxied = $Url
+        Mirrors = @($clean | ForEach-Object { "$_/$Url" })
+    }
+}
+
+# 探测每条线路是否可用（读取 64KB 即停），返回按延迟升序排列的候选列表
+# 探测每条线路是否可用（读取 64KB 即停），返回按延迟升序排列的候选列表。
+# 策略：先探测直连与代理这两条"短路径"，任一可用就跳过镜像探测，
+#       避免在直连/代理已经很快时白白花时间测一堆镜像。
+function Test-UrlCandidates {
+    param($Candidates, [string]$Label = '下载源')
+    $probe = New-Object System.Collections.Generic.List[object]
+    $directMs = -1
+    $proxyMs = -1
+    $mirrorUp = 0
+    $mirrorTotal = @($Candidates.Mirrors).Count
+    $mirrorSkipped = $false
+
+    # 直连探测失败时再给一次机会：TUN/代理客户端的出口节点轮换会让单次探测偶发失败
+    $directMs = -1
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $directMs = Test-DownloadSpeed -Url $Candidates.Direct -TimeoutSec 5 -TestBytes 64KB -NoProxy -Ms
+        if ($directMs -ge 0) { break }
+        if ($attempt -lt 2) { Start-Sleep -Milliseconds 400 }
+    }
+    if ($directMs -ge 0) { $probe.Add([pscustomobject]@{ Url = $Candidates.Direct; Ms = $directMs; Route = '直连'; NoProxy = $true }) }
+
+    if ($script:SysProxy) {
+        $proxyMs = Test-DownloadSpeed -Url $Candidates.Proxied -TimeoutSec 5 -TestBytes 64KB -Proxy $script:ProxyConfig.ForCurl -Ms
+        if ($proxyMs -ge 0) { $probe.Add([pscustomobject]@{ Url = $Candidates.Proxied; Ms = $proxyMs; Route = '代理'; NoProxy = $false }) }
+    }
+
+    # 只有直连/代理确实很快（<400ms 就能拿到首批 64KB）时才跳过镜像探测，
+    # 否则镜像可能反而更快，仍然值得测一遍。
+    $fastDirect = ($directMs -ge 0 -and $directMs -lt 400)
+    $fastProxy = ($proxyMs -ge 0 -and $proxyMs -lt 400)
+    if ($fastDirect -or $fastProxy) {
+        $mirrorSkipped = $true
+    }
+    else {
+        foreach ($mu in $Candidates.Mirrors) {
+            $ms = Test-DownloadSpeed -Url $mu -TimeoutSec 5 -TestBytes 64KB -NoProxy -Ms
+            if ($ms -ge 0) { $probe.Add([pscustomobject]@{ Url = $mu; Ms = $ms; Route = '镜像'; NoProxy = $true }); $mirrorUp++ }
+        }
+    }
+
+    if ($directMs -ge 0) { Write-Info "GitHub 直连可用 (${directMs}ms)" } else { Write-Info 'GitHub 直连不可用' }
+    if ($script:SysProxy) {
+        if ($proxyMs -ge 0) { Write-Info "代理线路可用 (${proxyMs}ms)" }
+        else { Write-Info '代理线路不可用（代理未开启、已失效，或代理不允许访问 GitHub）' }
+    }
+    if ($mirrorSkipped) { Write-Info '已选定直连/代理，跳过镜像探测' }
+    else { Write-Info "镜像可用 $mirrorUp/$mirrorTotal 个" }
+
+    if ($probe.Count -eq 0) { return @() }
+    return @($probe | Sort-Object Ms)
+}
+
+# ======== DNS 加速（中国 DNS 解析 + 测速 + curl --resolve） ========
+# 注意：仅在「直连」线路上使用 --resolve 钉住 IP。有代理时 DNS 由代理侧完成，
+# 钉住 IP 反而可能指向不可用的解析结果，故代理线路不带 --resolve。
 $DnsChina = @('223.5.5.5', '114.114.114.114', '119.29.29.29')
 $SlowDomains = @('raw.githubusercontent.com', 'github.com', 'codeload.github.com')
 $script:BestIps = @{}
@@ -89,6 +581,8 @@ function Test-IpSpeed {
     return -1
 }
 function Initialize-DnsAccel {
+    # 有代理时不做 IP 钉定：DNS 解析发生在代理侧，客户端测到的速度没有参考意义
+    if ($script:SysProxy) { Write-Info '已启用代理，跳过 DNS 直连加速'; return }
     try {
         Write-Info '正在测速 DNS 解析...'
         foreach ($dom in $SlowDomains) {
@@ -122,38 +616,18 @@ $script:HasPwsh = $false
 $MaaApiBase = 'https://api.maa.plus/MaaAssistantArknights/api'
 $MaaApiBase2 = 'https://api2.maa.plus/MaaAssistantArknights/api'
 $MirrorHosts = @(
-    'https://gh.ddlc.top',
-    'https://gh-proxy.com',
-    'https://agent.imgg.dev'
-)
-$GithubProxies = @(
+    'https://gh-proxy.com/',
+    'https://ghproxy.net/',
     'https://gh.ddlc.top/',
-    'https://gh-proxy.com/'
+    'https://ghproxy.homeboyc.cn/'
 )
-function Build-MirrorUrls {
-    param([string]$OriginalUrl, [switch]$IncludeArchiveOnly, [switch]$PreferMirror)
-    $urls = @()
-    foreach ($m in $MirrorHosts) {
-        if ($IncludeArchiveOnly -and $m -eq 'https://agent.imgg.dev') {
-            $urls += $OriginalUrl -replace 'https://github\.com/', "$m/"
-        } else {
-            $urls += "$m/$OriginalUrl"
-        }
-    }
-    foreach ($p in $GithubProxies) {
-        if ($urls -notcontains "$p$OriginalUrl") { $urls += "$p$OriginalUrl" }
-    }
-    if ($script:SysProxy -and $PreferMirror -and $urls -notcontains $OriginalUrl) { $urls += $OriginalUrl }
-    if ($urls -notcontains $OriginalUrl) { $urls += $OriginalUrl }
-    return $urls
-}
 $ResourceRepo = 'MaaAssistantArknights/MaaResource'
 $ResourceArchiveUrl = "https://github.com/$ResourceRepo/archive/refs/heads/main.zip"
 $ResourceVersionUrl = "https://raw.githubusercontent.com/$ResourceRepo/main/resource/version.json"
 $ResVersionCdnUrl = "https://cdn.jsdelivr.net/gh/$ResourceRepo@main/resource/version.json"
 $SummaryApi = 'version/summary.json'
 $MaxRetries = 2
-$PreserveDirs = @('achievement', 'background', 'cache', 'config', 'data', 'debug')
+$PreserveDirs = @('achievement', 'background', 'cache', 'config', 'data', 'debug', 'resource')
 
 # ======== 等待提示（所有操作用） ========
 function Show-Wait { param([string]$Msg) Write-Host "  ⏳ $Msg" -ForegroundColor DarkYellow }
@@ -163,7 +637,6 @@ function Write-Log {
     param([string]$Level, [string]$Message)
     $time = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $line = "[$time][$Level] $Message"
-    Add-Content -Path $LogFile -Value $line -Encoding UTF8
     switch ($Level) {
         'INFO' { Write-Host "[信息] $Message" -ForegroundColor Cyan }
         'OK' { Write-Host "[成功] $Message" -ForegroundColor Green }
@@ -189,12 +662,21 @@ function Set-State {
 function Clear-State { if (Test-Path $StateFile) { Remove-Item -Force $StateFile } }
 
 # ======== 工具函数 ========
+function New-WebProxyOrNull {
+    param([string]$Address)
+    # SOCKS 代理无法交给 .NET 使用，返回 $null 表示直连（由 curl 处理代理）
+    if (-not $Address) { return $null }
+    if ($Address -match '^(socks4|socks4a|socks5|socks5h)://') { return $null }
+    try { return New-Object System.Net.WebProxy($Address) } catch { return $null }
+}
+
 function Invoke-GetJson {
-    param([string]$Url, [int]$TimeoutSec = 15)
+    param([string]$Url, [int]$TimeoutSec = 15, [string]$Proxy = '')
     try {
         $req = [System.Net.HttpWebRequest]::Create($Url)
         $req.Method = 'GET'; $req.Timeout = $TimeoutSec * 1000; $req.ReadWriteTimeout = $TimeoutSec * 1000
         $req.UserAgent = 'MAA-Update/2.2'
+        if ($Proxy) { $req.Proxy = New-WebProxyOrNull $Proxy }
         $resp = $req.GetResponse()
         $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
         $json = $reader.ReadToEnd(); $resp.Close(); $reader.Close()
@@ -203,17 +685,18 @@ function Invoke-GetJson {
     catch { return $null }
 }
 
-function Get-FileSize {
-    param([string]$Url, [int]$TimeoutSec = 10)
-    try {
-        $req = [System.Net.HttpWebRequest]::Create($Url)
-        $req.Method = 'HEAD'; $req.Timeout = $TimeoutSec * 1000; $req.ReadWriteTimeout = $TimeoutSec * 1000
-        $req.UserAgent = 'MAA-Update/2.2'
-        $resp = $req.GetResponse()
-        $size = $resp.ContentLength; $resp.Close()
-        return [long]$size
+# 多来源按序尝试，返回第一个可解析且满足 $Validate 的结果
+function Get-FirstJson {
+    param([string[]]$Urls, [scriptblock]$Validate = $null, [int]$TimeoutSec = 10, [int]$Rounds = 2)
+    for ($i = 1; $i -le $Rounds; $i++) {
+        if ($i -gt 1) { Write-Info "重试第 $i 次..." }
+        Show-Wait "[$i/$Rounds] 正在检查资源版本..."
+        foreach ($u in $Urls) {
+            $j = Invoke-GetJson $u -TimeoutSec $TimeoutSec
+            if ($j -and ((-not $Validate) -or (& $Validate $j))) { return $j }
+        }
     }
-    catch { return -1 }
+    return $null
 }
 
 function Format-FileSize {
@@ -223,6 +706,39 @@ function Format-FileSize {
     if ($Bytes -ge 1MB) { return '{0:N2} MB' -f ($Bytes / 1MB) }
     if ($Bytes -ge 1KB) { return '{0:N2} KB' -f ($Bytes / 1KB) }
     return "$Bytes B"
+}
+
+# ======== 实际下载测速（替代 HEAD 延迟测速，解决 TUN 下全0ms 问题） ========
+# 返回耗时毫秒数；-1 表示不可用
+function Test-DownloadSpeed {
+    param([string]$Url, [int]$TimeoutSec = 5, [long]$TestBytes = 100KB, [string]$Proxy = '', [switch]$NoProxy, [switch]$Ms)
+    try {
+        $req = [System.Net.HttpWebRequest]::Create($Url)
+        $req.Method = 'GET'
+        $req.Timeout = $TimeoutSec * 1000
+        $req.ReadWriteTimeout = $TimeoutSec * 1000
+        $req.UserAgent = 'MAA-Update/2.2'
+        $req.AddRange(0, $TestBytes - 1)
+        if ($NoProxy) { $req.Proxy = $null }
+        elseif ($Proxy) { $req.Proxy = New-WebProxyOrNull $Proxy }
+        $resp = $req.GetResponse()
+        $stream = $resp.GetResponseStream()
+        $buf = New-Object byte[] 65536
+        $totalRead = 0
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($totalRead -lt $TestBytes) {
+            $read = $stream.Read($buf, 0, $buf.Length)
+            if ($read -le 0) { break }
+            $totalRead += $read
+        }
+        $sw.Stop()
+        $stream.Close(); $resp.Close()
+        if ($totalRead -eq 0) { return -1 }
+        # -Ms：返回耗时毫秒（用于线路探测排序）；否则返回速度对象
+        if ($Ms) { return [long]$sw.ElapsedMilliseconds }
+        return @{ Url = $Url; SpeedBps = [long]($totalRead * 1000 / [Math]::Max($sw.ElapsedMilliseconds, 1)) }
+    }
+    catch { return -1 }
 }
 
 function Test-ZipPathSafety {
@@ -446,6 +962,7 @@ function Ensure-Pwsh {
     $pwshMsiPath = Join-Path $TempDir "PowerShell-$pwshVer-win-x64.msi"
     $pwshDlOk = $false
     if ($script:HasCurl) {
+        New-Directory $TempDir
         & curl.exe -L -f -o $pwshMsiPath $pwshCdnUrl --connect-timeout 10 --max-time 120
         if ($LASTEXITCODE -eq 0 -and (Test-Path $pwshMsiPath)) { $pwshDlOk = $true }
     }
@@ -470,8 +987,9 @@ function Ensure-Pwsh {
 
 # ======== HTTP/2 下载（pwsh + .NET SocketsHttpHandler） ========
 function Start-Http2Download {
-    param([string]$Url, [string]$OutFile, [string]$DisplayName, [long]$ExpectedSize = 0)
+    param([string]$Url, [string]$OutFile, [string]$DisplayName, [long]$ExpectedSize = 0, [string]$Proxy = '')
     if (-not $script:HasPwsh) { return $false }
+    if ($Proxy -and $Proxy -match '^(socks4|socks4a|socks5|socks5h)://') { return $false }
     try {
         Write-Info "尝试 HTTP/2 下载 (pwsh)..."
         New-Directory $TempDir -Secure
@@ -479,10 +997,11 @@ function Start-Http2Download {
         $ps1 = Join-Path $TempDir 'http2_dl.ps1'
         # 使用安全的参数传递，避免命令注入
         $ps1Content = @'
-param([string]$Url, [string]$OutFile)
+param([string]$Url, [string]$OutFile, [string]$Proxy)
 try {
     $h = [System.Net.Http.SocketsHttpHandler]::new()
     $h.EnableMultipleHttp2Connections = $true
+    if ($Proxy) { $h.Proxy = [System.Net.WebProxy]::new($Proxy); $h.UseProxy = $true } else { $h.UseProxy = $false }
     $c = [System.Net.Http.HttpClient]::new($h)
     $c.DefaultRequestHeaders.UserAgent.ParseAdd('MAA-Update/2.2')
     $c.Timeout = [TimeSpan]::FromSeconds(600)
@@ -498,7 +1017,7 @@ try {
 } catch { exit 2 }
 '@
         $ps1Content | Set-Content $ps1 -Encoding UTF8
-        & $script:PwshPath -NoProfile -File $ps1 -Url $Url -OutFile $OutFile
+        & $script:PwshPath -NoProfile -File $ps1 -Url $Url -OutFile $OutFile -Proxy $Proxy
         $http2ExitCode = $LASTEXITCODE
         Remove-Item -Force $ps1 -ErrorAction SilentlyContinue
         if ($http2ExitCode -eq 0 -and (Test-Path $OutFile)) {
@@ -515,13 +1034,20 @@ try {
 
 # ======== 下载（curl → HttpWebRequest → pwsh HTTP/2 → 分片） ========
 function Start-Download {
-    param([string]$Url, [string]$OutFile, [string]$DisplayName, [long]$ExpectedSize = 0)
+    param([string]$Url, [string]$OutFile, [string]$DisplayName, [long]$ExpectedSize = 0, [switch]$NoProxy)
+
+    $proxyArg = ''
+    if (-not $NoProxy -and $script:ProxyConfig) { $proxyArg = $script:ProxyConfig.ForCurl }
+    # 直连线路可以带 --resolve（DNS 加速）；代理线路必须让代理解析域名
+    $resolveArgs = @()
+    if ($NoProxy -and $script:CurlResolve) { $resolveArgs = $script:CurlResolve }
 
     # 0. curl.exe（TCP 栈优于 .NET，优先）
     if ($script:HasCurl) {
-        $curlArgs = @('-SfL', '-o', $OutFile, '--progress-bar', '--connect-timeout', '5', '--max-time', '600', '--speed-limit', '1024', '--speed-time', '30', '--ssl-no-revoke')
-        if ($script:SysProxy) { $curlArgs += '--proxy', $script:SysProxy }
-        $curlArgs += $script:CurlResolve
+        $curlArgs = @('-SfL', '-o', $OutFile, '--progress-bar', '--connect-timeout', '10', '--max-time', '900',
+            '--retry', '2', '--retry-delay', '2', '--ssl-no-revoke', '-A', 'MAA-Update/2.2')
+        if ($proxyArg) { $curlArgs += '--proxy', $proxyArg } else { $curlArgs += '--noproxy', '*' }
+        $curlArgs += $resolveArgs
         $curlArgs += $Url
         for ($try = 1; $try -le $MaxRetries; $try++) {
             if ($try -gt 1) { Write-Warn "curl 重试第 $try 次..."; Start-Sleep -Milliseconds (Get-Random -Minimum 500 -Maximum 2500) }
@@ -552,7 +1078,7 @@ function Start-Download {
             $req = [System.Net.HttpWebRequest]::Create($Url)
             $req.Method = 'GET'; $req.Timeout = 15000; $req.ReadWriteTimeout = 60000
             $req.UserAgent = 'MAA-Update/2.2'
-            if ($script:SysProxy) { $req.Proxy = New-Object System.Net.WebProxy($script:SysProxy) }
+            if ($NoProxy) { $req.Proxy = $null } elseif ($proxyArg) { $req.Proxy = New-WebProxyOrNull $proxyArg }
             $resp = $req.GetResponse()
             $totalLen = $resp.ContentLength
             $stream = $resp.GetResponseStream()
@@ -585,7 +1111,7 @@ function Start-Download {
     Write-Progress -Activity "下载 $DisplayName" -Completed
 
     # 2. pwsh HTTP/2 下载（SocketsHttpHandler，受限网络兜底）
-    if (Start-Http2Download -Url $Url -OutFile $OutFile -DisplayName $DisplayName -ExpectedSize $ExpectedSize) {
+    if (Start-Http2Download -Url $Url -OutFile $OutFile -DisplayName $DisplayName -ExpectedSize $ExpectedSize -Proxy $proxyArg) {
         return $true
     }
 
@@ -598,17 +1124,79 @@ function Start-Download {
     return $false
 }
 
-# ======== 版本检测（4 级降级） ========
+# 按候选线路依次尝试下载；成功返回 $true
+function Invoke-CandidateDownload {
+    param([string]$OutFile, [string]$DisplayName, [long]$ExpectedSize = 0, [string]$Sha256 = '', [array]$Probes,
+        [string]$DirectUrl = '', [string]$ProxiedUrl = '', [array]$MirrorUrls = @(),
+        [int]$MaxAttempts = 4)
+
+    $attempt = 0
+    $tested = @()
+
+    # 已探测成功的线路按探测速度优先
+    foreach ($p in $Probes) {
+        if ($attempt -ge $MaxAttempts) { break }
+        $attempt++
+        $tested += $p.Url
+        $label = if ($p.NoProxy) { '直连/镜像' } else { '代理' }
+        if ($attempt -gt 1) { Write-Info "切换下载源 ($label): $($p.Url)" }
+        if (Test-Path $OutFile) { Remove-Item -Force $OutFile -ErrorAction SilentlyContinue }
+        $ok = if ($p.ContainsKey('NoProxy') -and $p.NoProxy) {
+            Start-Download -Url $p.Url -OutFile $OutFile -DisplayName $DisplayName -ExpectedSize $ExpectedSize -NoProxy
+        } else {
+            Start-Download -Url $p.Url -OutFile $OutFile -DisplayName $DisplayName -ExpectedSize $ExpectedSize
+        }
+        if ($ok) {
+            if (-not $Sha256) { return $true }
+            $hash = (Get-FileHash $OutFile -Algorithm SHA256).Hash
+            if ($hash -eq $Sha256) { Write-Ok 'SHA256 校验通过'; return $true }
+            Write-Err 'SHA256 校验失败，文件可能损坏，换源重试'
+            Remove-Item -Force $OutFile -ErrorAction SilentlyContinue
+            continue
+        }
+        Write-Warn "下载源不可用: $($p.Url)"
+    }
+
+    # 未探测成功的线路再兜底试一遍
+    $fallback = New-Object System.Collections.Generic.List[object]
+    if ($DirectUrl -and ($tested -notcontains $DirectUrl)) { $fallback.Add([pscustomobject]@{ Url = $DirectUrl; NoProxy = $true }) }
+    if ($script:SysProxy -and $ProxiedUrl -and ($tested -notcontains $ProxiedUrl)) { $fallback.Add([pscustomobject]@{ Url = $ProxiedUrl; NoProxy = $false }) }
+    foreach ($mu in $MirrorUrls) { if ($tested -notcontains $mu) { $fallback.Add([pscustomobject]@{ Url = $mu; NoProxy = $true }) } }
+
+    foreach ($f in $fallback) {
+        if ($attempt -ge ($MaxAttempts + 3)) { break }
+        $attempt++
+        Write-Info "兜底尝试: $($f.Url)"
+        if (Test-Path $OutFile) { Remove-Item -Force $OutFile -ErrorAction SilentlyContinue }
+        $ok = if ($f.NoProxy) {
+            Start-Download -Url $f.Url -OutFile $OutFile -DisplayName $DisplayName -ExpectedSize $ExpectedSize -NoProxy
+        } else {
+            Start-Download -Url $f.Url -OutFile $OutFile -DisplayName $DisplayName -ExpectedSize $ExpectedSize
+        }
+        if ($ok) {
+            if (-not $Sha256) { return $true }
+            $hash = (Get-FileHash $OutFile -Algorithm SHA256).Hash
+            if ($hash -eq $Sha256) { Write-Ok 'SHA256 校验通过'; return $true }
+            Write-Err 'SHA256 校验失败，文件可能损坏，换源重试'
+            Remove-Item -Force $OutFile -ErrorAction SilentlyContinue
+        }
+    }
+    return $false
+}
+
+# ======== 版本检测（多来源取最新） ========
 function Get-CurrentVersion {
+    $candidates = New-Object System.Collections.Generic.List[object]
+
     # 1: MAA.exe
     $exePath = Join-Path $ScriptDir 'MAA.exe'
     if (Test-Path $exePath) {
         try {
             $ver = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exePath)
             foreach ($prop in @($ver.ProductVersion, $ver.FileVersion)) {
-                if ($prop -and ($prop -notmatch '^0+(\.0+)*$')) {
-                    $v = "v$(($prop -split '\+')[0].TrimStart('v'))"
-                    Write-Info "当前版本 (MAA.exe): $v"; return $v
+                if ($prop -and ($prop -notmatch '^0+(\.0+)*$') -and (ConvertTo-VersionParts $prop)) {
+                    $candidates.Add(@{ Version = "v$(($prop -split '\+')[0].TrimStart('vV'))"; Source = 'MAA.exe' })
+                    break
                 }
             }
         }
@@ -620,25 +1208,51 @@ function Get-CurrentVersion {
         try {
             $ver = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($dllPath)
             foreach ($prop in @($ver.ProductVersion, $ver.FileVersion)) {
-                if ($prop -and ($prop -notmatch '^0+(\.0+)*$')) {
-                    $v = "v$(($prop -split '\+')[0].TrimStart('v'))"
-                    Write-Info "当前版本 (MaaCore.dll): $v"; return $v
+                if ($prop -and ($prop -notmatch '^0+(\.0+)*$') -and (ConvertTo-VersionParts $prop)) {
+                    $candidates.Add(@{ Version = "v$(($prop -split '\+')[0].TrimStart('vV'))"; Source = 'MaaCore.dll' })
+                    break
                 }
             }
         }
         catch {}
     }
-    # 3: gui.json
+    # 3: config/gui.json —— MAA 更新器在更新完成后会写入实际运行版本
+    #    （例如 6.19.2-beta.2），比 exe 文件版本更贴近真实运行版本。
     $cfgPath = Join-Path $ScriptDir 'config/gui.json'
     if (Test-Path $cfgPath) {
         try {
             $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            if ($cfg.VersionUpdate.name) { Write-Info "当前版本 (gui.json): $($cfg.VersionUpdate.name)"; return $cfg.VersionUpdate.name }
+            $names = @()
+            foreach ($holder in @($cfg.VersionUpdate, ($cfg.Global.VersionUpdate), ($cfg.Default.VersionUpdate))) {
+                if ($holder -and $holder.name) { $names += [string]$holder.name }
+            }
+            foreach ($n in $names) {
+                if (-not $n) { continue }
+                if ($n -notmatch '\d') { continue }
+                if (-not (ConvertTo-VersionParts $n)) { continue }
+                $candidates.Add(@{ Version = "v$($n.TrimStart('vV'))"; Source = 'gui.json' })
+                break
+            }
         }
         catch {}
     }
-    Write-Warn '无法检测当前版本，使用 0.0.0'
-    return 'v0.0.0'
+
+    if ($candidates.Count -eq 0) {
+        Write-Warn '无法检测当前版本，使用 v0.0.0'
+        return 'v0.0.0'
+    }
+    # 取语义化版本最高者：避免 gui.json 中的历史版本号把真实版本"拉低"（导致重复更新）
+    # 或把真实版本"抬高"（导致漏更新）
+    $best = $null
+    foreach ($c in $candidates) {
+        if (-not $best) { $best = $c; continue }
+        if ((Compare-SemVer $c.Version $best.Version) -gt 0) { $best = $c }
+    }
+    foreach ($c in $candidates) {
+        $mark = if ($c.Source -eq $best.Source) { '← 采用' } else { '' }
+        Write-Info "版本来源 $($c.Source): $($c.Version) $mark"
+    }
+    return $best.Version
 }
 
 # ======== API 缓存 ========
@@ -658,23 +1272,26 @@ function Write-ApiCache {
     $Data | ConvertTo-Json -Depth 10 -Compress | Set-Content $cache -Encoding UTF8
 }
 
+# 实时请求优先；仅当实时请求失败时才回退缓存（避免把残缺响应写进缓存后长期使用）
 function Request-WithCache {
     param([string]$Url, [string]$CacheKey, [int]$TimeoutSec = 15)
     $data = Invoke-GetJson $Url -TimeoutSec $TimeoutSec
     if ($data) { Write-ApiCache -ApiPath $CacheKey -Data $data; return $data }
     $cached = Read-ApiCache -ApiPath $CacheKey
-    if ($cached) { Write-Warn "API 不可达，使用缓存 ($CacheKey)"; return $cached }
+    if ($cached) { Write-Warn "API 不可达，使用本地缓存 ($CacheKey)"; return $cached }
     return $null
 }
 
-# ======== 资源版本缓存（24h 过期） ========
+# ======== 资源版本缓存（4h 过期） ========
 $ResCacheFile = Join-Path $CacheDir 'resource_version.json'
 function Read-ResVersionCache {
     if (-not (Test-Path $ResCacheFile)) { return $null }
     try {
         $cache = Get-Content $ResCacheFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        $age = [DateTime]::Now - [DateTime]::ParseExact($cache.cached_at, 'yyyy-MM-dd HH:mm:ss', $null)
-        if ($age.TotalHours -le 4) { return $cache }
+        if (-not $cache.last_updated) { return $null }
+        $age = [DateTime]::Now - [DateTime]::ParseExact([string]$cache.cached_at, 'yyyy-MM-dd HH:mm:ss', $null)
+        # 过期或时间戳无法解析 → 视为无缓存，强制联网刷新
+        if ($age.TotalHours -le 4 -and $age.TotalHours -ge -1) { return $cache }
     }
     catch {}
     return $null
@@ -686,6 +1303,201 @@ function Write-ResVersionCache {
     $cache | ConvertTo-Json -Compress | Set-Content $ResCacheFile -Encoding UTF8
 }
 
+# 解析资源时间戳（容错 .fff 缺失 / 空格与 T 分隔两种写法）
+function ConvertTo-ResourceTime {
+    param([string]$Value)
+    $formats = @('yyyy-MM-dd HH:mm:ss.fff', 'yyyy-MM-dd HH:mm:ss', "yyyy-MM-dd'T'HH:mm:ss.fff", "yyyy-MM-dd'T'HH:mm:ss")
+    foreach ($f in $formats) {
+        try { return [DateTime]::ParseExact([string]$Value, $f, $null) } catch {}
+    }
+    try { return [DateTime]::Parse([string]$Value) } catch {}
+    return $null
+}
+
+function Get-LocalResourceTime {
+    $localVerPath = Join-Path $ScriptDir 'resource/version.json'
+    if (-not (Test-Path $localVerPath)) { return $null }
+    try {
+        $localJson = Get-Content $localVerPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        return ConvertTo-ResourceTime $localJson.last_updated
+    }
+    catch { return $null }
+}
+
+# 获取远程资源版本：jsDelivr CDN → raw.githubusercontent 镜像 → GitHub 直连/代理
+function Get-RemoteResourceTime {
+    $remoteJson = Read-ResVersionCache
+    if ($remoteJson) { Write-Info '使用缓存的资源版本'; return (ConvertTo-ResourceTime $remoteJson.last_updated) }
+
+    $urls = @($ResVersionCdnUrl)
+    # 注意（原版 bug）：镜像站尾部带 '/'，直接拼接会变成
+    # 'https://gh-proxy.comhttps://raw...'，必须先补上分隔斜杠
+    $urls += @($MirrorHosts | ForEach-Object { "$($_.TrimEnd('/'))/$ResourceVersionUrl" })
+    if ($script:SysProxy) { $urls += $ResourceVersionUrl }
+    $remoteJson = Get-FirstJson -Urls $urls -Validate { param($j) $null -ne $j.last_updated } -TimeoutSec 10
+    if ($remoteJson -and $remoteJson.last_updated) {
+        Write-ResVersionCache ([string]$remoteJson.last_updated)
+        return (ConvertTo-ResourceTime $remoteJson.last_updated)
+    }
+    return $null
+}
+
+# ======== 跨通道最新版解析 ========
+# beta 语义：取「beta 公测版」与「stable 正式版」中语义化版本更高者。
+# 这样当 6.19.2 已正式发布、而 beta 通道仍停留在 6.19.2-beta.2 时，
+# 使用 beta 脚本的用户依然能更新到 6.19.2（而不是被判定为"已是最新"）。
+function Resolve-MaaRelease {
+    param([string]$RequestedChannel)
+
+    if ($RequestedChannel -in @('beta', 'alpha')) {
+        $order = @($RequestedChannel)
+        if ($order -notcontains 'stable') { $order += 'stable' }
+        if ($RequestedChannel -eq 'alpha' -and $order -notcontains 'beta') { $order += 'beta' }
+        Write-Info "通道 $RequestedChannel：同时比较 $(($order -join ' / ')) 中的最新版"
+    }
+    else { $order = @('stable') }
+
+    $summary = $null
+    $summarySource = ''
+    foreach ($base in @($MaaApiBase, $MaaApiBase2)) {
+        $url = "$base/$SummaryApi"
+        Write-Info "请求版本摘要: $url"
+        $summary = Request-WithCache -Url $url -CacheKey "version/summary.json"
+        if ($summary -and ($summary.PSObject.Properties.Name -contains 'stable')) { $summarySource = $base; break }
+    }
+    if (-not $summary -or -not ($summary.PSObject.Properties.Name -contains 'stable')) {
+        Write-Err '无法获取版本信息（API 和缓存均不可用）'
+        return $null
+    }
+
+    # 拉取候选通道详情
+    $cache = @{}
+    foreach ($ch in $order) {
+        if (-not $summary.$ch) { continue }
+        $ver = [string]$summary.$ch.version
+        $detail = $summary.$ch.detail
+        if (-not $detail) { $detail = "$summarySource/version/$ch.json" }
+        $json = Request-WithCache -Url $detail -CacheKey "version/$ch.json"
+        if (-not $json) {
+            $alt = "$MaaApiBase2/version/$ch.json"
+            $json = Request-WithCache -Url $alt -CacheKey "version/$ch.json"
+        }
+        if (-not $json) { Write-Warn "无法获取 $ch 通道详情，跳过"; continue }
+        if ($ver -and (Compare-SemVer ([string]$json.version) $ver) -gt 0) { $ver = [string]$json.version }
+        $cache[$ch] = @{ Version = $ver; Detail = $detail; Json = $json }
+    }
+    if ($cache.Count -eq 0) { Write-Err '无法获取版本详情'; return $null }
+
+    # 选择最新版本
+    $names = @(Sort-VersionDescending @($cache.Keys | ForEach-Object { $cache[$_].Version }))
+    # Sort-VersionDescending 返回的是版本号，映射回通道名
+    $ordered = New-Object System.Collections.Generic.List[string]
+    foreach ($v in $names) { foreach ($k in $cache.Keys) { if ($cache[$k].Version -eq $v -and $ordered -notcontains $k) { $ordered.Add($k) } } }
+    $names = @($ordered)
+    $best = $cache[$names[0]]
+    if ($cache.ContainsKey($RequestedChannel) -and $names[0] -ne $RequestedChannel) {
+        $reqVer = $cache[$RequestedChannel].Version
+        if ((Compare-SemVer $best.Version $reqVer) -gt 0) {
+            Write-Ok "最新版本: $($best.Version)（$($names[0]) 通道）比 $RequestedChannel 通道的 $reqVer 更新，按时间取最新 → $($best.Version)"
+        }
+        else {
+            # 两通道版本号相同时优先正式版（stable）
+            Write-Ok "最新版本: $($best.Version)（$RequestedChannel 与 $($names[0]) 通道均为该版本，优先正式版）"
+        }
+    }
+    else { Write-Ok "最新 $RequestedChannel 版本: $($best.Version)" }
+
+    return @{
+        Version   = [string]$best.Version
+        Channel   = $names[0]
+        Detail    = $best.Detail
+        Json      = $best.Json
+        Requested = $RequestedChannel
+        All       = $cache
+    }
+}
+
+# ======== 更新包选择 ========
+function Select-MaaAsset {
+    param($Release, [string]$CurrentVersion, [string]$Arch)
+
+    $full = New-Object System.Collections.Generic.List[object]
+    $otas = New-Object System.Collections.Generic.List[object]
+    foreach ($a in $Release.Json.details.assets) {
+        $info = Parse-GithubAssetName ([string]$a.name)
+        if (-not $info.Arch -or $info.Arch -ne $Arch) { continue }
+        if ($info.IsOta) {
+            $fromOk = ConvertTo-VersionParts $info.FromVersion
+            if (-not $fromOk) { continue }
+            $otas.Add(@{ Asset = $a; Info = $info })
+        }
+        else { $full.Add(@{ Asset = $a; Info = $info }) }
+    }
+
+    # 完整包：选语义化版本最高的 x64/arm64 包（兼容预发布命名 MAA-v6.19.0-beta.2-win-x64.zip）
+    $bestFull = $null
+    foreach ($f in $full) {
+        if (-not $bestFull) { $bestFull = $f; continue }
+        if ((Compare-SemVer $f.Info.Version $bestFull.Info.Version) -gt 0) { $bestFull = $f }
+    }
+
+    # OTA 选择策略（按优先级）：
+    #   1) 源版本恰好等于当前版本（含 gui.json 记录的夜间版全名）
+    #   2) 源版本 = 当前版本的基础版本号（例：当前 6.19.2-beta.2.d010.ga7ee2c2bf7 时用 beta.2 的 OTA）
+    #   3) 没有任何精确匹配时，从「源版本 <= 当前版本」里挑。同一基础版本下的夜间版更贴近
+    #      当前文件状态，因此只要它不比兜底候选更旧就优先使用。
+    # 注意：这里刻意避免 `if (...) { $x = ...; continue }` 的写法 —— 在「赋值即语句」的
+    # 分支里 PowerShell 会终止整个管道，导致循环提前结束（曾导致 OTA 选错源版本）。
+    $cur = ConvertTo-VersionParts $CurrentVersion
+    $curBase = Get-VersionBase $CurrentVersion
+    $curVerNoV = $CurrentVersion.TrimStart('vV')
+    $otaExact = $null
+    $otaBase = $null
+    $applicable = New-Object System.Collections.Generic.List[object]
+    foreach ($o in $otas) {
+        if ($o.Info.ToVersion -ne $Release.Version) { continue }
+        $fromNoV = $o.Info.FromVersion.TrimStart('vV')
+        if ($fromNoV -eq $curVerNoV) { $otaExact = $o }
+        elseif ($curBase -and $fromNoV -eq $curBase) { $otaBase = $o }
+        elseif ($cur -and (Compare-SemVer $o.Info.FromVersion $CurrentVersion) -le 0) { $applicable.Add($o) }
+    }
+    $otaBest = $otaExact
+    if (-not $otaBest) { $otaBest = $otaBase }
+    if (-not $otaBest -and $applicable.Count -gt 0) {
+        $sameBaseBest = $null
+        foreach ($o in $applicable) {
+            if ($curBase -and (Get-VersionBase $o.Info.FromVersion) -eq $curBase) {
+                if (-not $sameBaseBest) { $sameBaseBest = $o }
+                elseif ((Compare-SemVer $o.Info.FromVersion $sameBaseBest.Info.FromVersion) -gt 0) { $sameBaseBest = $o }
+            }
+            if (-not $otaBest) { $otaBest = $o }
+            elseif ((Compare-SemVer $o.Info.FromVersion $otaBest.Info.FromVersion) -gt 0) { $otaBest = $o }
+        }
+        if ($sameBaseBest -and (Compare-SemVer $sameBaseBest.Info.FromVersion $otaBest.Info.FromVersion) -ge 0) { $otaBest = $sameBaseBest }
+    }
+
+    $latestFull = if ($bestFull) { $bestFull } else { $null }
+    $label = if ($otaBest) { "OTA 增量包 $($otaBest.Info.FromVersion) → $($otaBest.Info.ToVersion)" }
+    elseif ($latestFull) { "完整包 $($latestFull.Info.Version)" }
+    else { '无' }
+    Write-Info "更新包选择: $label (当前 $CurrentVersion, 共 $($otas.Count) 个 OTA / $($full.Count) 个完整包)"
+
+    $selected = if ($otaBest) { $otaBest.Asset } elseif ($latestFull) { $latestFull.Asset } else { $null }
+    $type = if ($otaBest) { 'OTA' } elseif ($latestFull) { '完整包' } else { '' }
+    return @{
+        Version     = $Release.Version
+        Channel     = $Release.Channel
+        Type        = $type
+        Asset       = $selected
+        OtaAsset    = if ($otaBest) { $otaBest.Asset } else { $null }
+        OtaFrom     = if ($otaBest) { $otaBest.Info.FromVersion } else { '' }
+        OtaTarget   = if ($otaBest) { $otaBest.Info.ToVersion } else { '' }
+        FullAsset   = if ($latestFull) { $latestFull.Asset } else { $null }
+        DetailJson  = $Release.Json
+        Arch        = $Arch
+    }
+}
+
 # ======== 检查版本更新 ========
 function Check-VersionUpdate {
     Write-Step '检查 MAA 版本更新'
@@ -695,6 +1507,7 @@ function Check-VersionUpdate {
         try {
             $cfg = Get-Content $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
             $savedChannel = $cfg.'VersionUpdate.VersionType'
+            if (-not $savedChannel -and $cfg.VersionUpdate) { $savedChannel = $cfg.VersionUpdate.VersionType }
             if ($savedChannel) {
                 $channelMap = @{ '0' = 'stable'; '1' = 'beta'; '2' = 'alpha' }
                 $detected = $channelMap["$savedChannel"]
@@ -705,61 +1518,29 @@ function Check-VersionUpdate {
     }
     Write-Info "更新通道: $Channel"
 
-    # API 主备切换
-    $summary = $null
-    foreach ($base in @($MaaApiBase, $MaaApiBase2)) {
-        $url = "$base/$SummaryApi"
-        Write-Info "请求版本摘要: $url"
-        $summary = Request-WithCache -Url $url -CacheKey "version/summary.json"
-        if ($summary -and $summary.$Channel) { break }
-    }
-    if (-not $summary -or -not $summary.$Channel) {
-        Write-Err '无法获取版本信息（API 和缓存均不可用）'
+    $release = Resolve-MaaRelease -RequestedChannel $Channel
+    if (-not $release) { return $null }
+
+    $latestVer = [string]$release.Version
+    $cmp = Compare-SemVer $latestVer $script:CurrentVersion
+    if ($cmp -le 0 -and -not $Force) {
+        if ($cmp -eq 0) { Write-Ok "已是最新 ($($script:CurrentVersion))" }
+        else { Write-Ok "已是最新（当前 $($script:CurrentVersion) 高于可用版本 $latestVer）" }
         return $null
     }
-
-    $latestVer = $summary.$Channel.version
-    Write-Ok "最新 $Channel 版本: $latestVer"
-
-    # 版本相同时直接跳过，不查详情
-    $c = $script:CurrentVersion.TrimStart('v'); $l = $latestVer.TrimStart('v')
-    if ($c -eq $l -and -not $Force) { Write-Ok "已是最新 ($($script:CurrentVersion))"; return $null }
-
-    # 详情获取（主 API + 备用 API 两种方式）
-    $detailUrl = $summary.$Channel.detail
-    $detail = Request-WithCache -Url $detailUrl -CacheKey "version/$Channel.json"
-    if (-not $detail) {
-        $backupUrl = "$MaaApiBase2/version/$Channel.json"
-        $detail = Request-WithCache -Url $backupUrl -CacheKey "version/$Channel.json"
-    }
-    if (-not $detail) { Write-Err '无法获取版本详情'; return $null }
-
-    $assets = $detail.details.assets
-    if (-not $assets) { Write-Err '版本详情中无 assets 列表'; return $null }
+    if ($Force -and $cmp -eq 0) { Write-Warn "强制更新模式：重新安装 $latestVer" }
 
     $isArm = ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') -or ($env:PROCESSOR_ARCHITECTURE -eq 'ARM')
     $arch = if ($isArm) { 'arm64' } else { 'x64' }
 
-    # 优先 OTA，兜底完整包
-    $otaAsset = $null; $fullAsset = $null
-    $currentVer = $script:CurrentVersion
-    foreach ($a in $assets) {
-        $name = [string]$a.name
-        if (-not $name.Contains('win')) { continue }
-        if (($isArm) -xor ($name.Contains('arm64'))) { continue }
-        if ($name.Contains('OTA') -and $name.Contains($currentVer)) { $otaAsset = $a; Write-Info "找到匹配的 OTA 包: $name"; break }
-        if ($name -match "^MAA-v[\d\.]+(?:-[\w\.]+)?\-win-$arch\.zip$") { $fullAsset = $a }
-    }
-    # 总是优先 OTA，同时保留完整包作为第二级回退
-    $selected = $otaAsset; $pkgType = 'OTA'
-    if (-not $selected -and $fullAsset) { $selected = $fullAsset; $pkgType = '完整包' }
-    if (-not $selected) { Write-Err "未找到适用于 win-$arch 的更新包"; return $null }
+    $info = Select-MaaAsset -Release $release -CurrentVersion $script:CurrentVersion -Arch $arch
+    if (-not $info.Asset) { Write-Err "未找到适用于 win-$arch 的更新包"; return $null }
 
-    Write-Info "新版本: $latestVer ($pkgType)"
-    return @{ Version = $latestVer; Type = $pkgType; Asset = $selected; FullAsset = $fullAsset; DetailJson = $detail; Arch = $arch }
+    Write-Info "新版本: $latestVer ($($info.Type))"
+    return $info
 }
 
-# ======== 下载更新（镜像列表冗余） ========
+# ======== 下载更新（线路探测 + 多源冗余） ========
 function Download-UpdatePackage {
     param($UpdateInfo)
     $asset = $UpdateInfo.Asset
@@ -769,54 +1550,22 @@ function Download-UpdatePackage {
     $originalUrl = $asset.browser_download_url
 
     Write-Info "原始: $originalUrl"
-    $preferMirror = $true  # 始终优先使用镜像站
-    $tryOrder = Build-MirrorUrls $originalUrl -PreferMirror:$preferMirror
-
-    # 测速排序（仅对前 8 个候选测 HEAD，减少等待）
-    Write-Info "正在测试下载源可用性..."
-    $scoredSources = New-Object System.Collections.Generic.List[object]
-    $testedCount = 0; $allUrls = $tryOrder
-    foreach ($u in $allUrls) {
-        if ($testedCount -ge 8) { break }
-        try {
-            $req = [System.Net.HttpWebRequest]::Create($u)
-            $req.Method = 'HEAD'; $req.Timeout = 3000; $req.ReadWriteTimeout = 3000
-            $req.UserAgent = 'MAA-Update/2.2'
-            $sw = [System.Diagnostics.Stopwatch]::StartNew()
-            $resp = $req.GetResponse()
-            $sw.Stop(); $resp.Close()
-            $scoredSources.Add(@{ Url = $u; Ms = $sw.ElapsedMilliseconds })
-        } catch { continue }
-        $testedCount++
+    Write-Info '正在探测下载线路（直连 / 代理 / 镜像）...'
+    $cand = Get-DownloadCandidates -Url $originalUrl
+    $probes = Test-UrlCandidates -Candidates $cand
+    if ($probes.Count -eq 0) {
+        if ($script:SysProxy) { Write-Warn '所有线路探测失败。如代理对 GitHub 设置了直连/绕过规则，请关闭该规则后重试。' }
+        else { Write-Warn '所有线路探测失败，且未检测到代理。请检查网络或开启代理后重试。' }
     }
-    if ($scoredSources.Count -gt 0) {
-        $testedSet = @{}; $tryOrder = @()
-        foreach ($s in ($scoredSources | Sort-Object Ms)) { $tryOrder += $s.Url; $testedSet[$s.Url] = $true }
-        foreach ($u in $allUrls) { if (-not $testedSet.ContainsKey($u)) { $tryOrder += $u } }
-        Write-Info "最佳源: $($tryOrder[0]) ($(($scoredSources | Sort-Object Ms)[0].Ms)ms)"
-    }
+    else { Write-Info "最快线路: $($probes[0].Url) [$($probes[0].Route), $($probes[0].Ms)ms]" }
 
-    for ($try = 0; $try -lt $tryOrder.Count -and $try -lt ($MaxRetries + 2); $try++) {
-        $url = $tryOrder[$try]
-        if ($try -gt 0) { Write-Info "切换下载源: $url" }
-        
-        if ($DryRun) { Write-Warn '仅检查模式，跳过下载'; return $null }
-        if (Test-Path $filepath) { Remove-Item -Force $filepath }
-        Set-State -Phase 'downloading' -Version $UpdateInfo.Version -Detail $filename
-        
-        if (Start-Download -Url $url -OutFile $filepath -DisplayName $filename -ExpectedSize $expectedSize) {
-            if ($asset.sha256) {
-                Write-Info '验证 SHA256...'
-                $hash = Get-FileHash $filepath -Algorithm SHA256
-                if ($hash.Hash -ne $asset.sha256) {
-                    Write-Err 'SHA256 校验失败，文件可能损坏'
-                    Remove-Item -Force $filepath -ErrorAction SilentlyContinue
-                    continue
-                }
-                Write-Ok 'SHA256 校验通过'
-            }
-            return $filepath
-        }
+    if ($DryRun) { Write-Warn '仅检查模式，跳过下载'; return $null }
+    if (Test-Path $filepath) { Remove-Item -Force $filepath }
+    Set-State -Phase 'downloading' -Version $UpdateInfo.Version -Detail $filename
+
+    if (Invoke-CandidateDownload -OutFile $filepath -DisplayName $filename -ExpectedSize $expectedSize `
+            -Sha256 ([string]$asset.sha256) -Probes $probes -DirectUrl $cand.Direct -ProxiedUrl $cand.Proxied -MirrorUrls $cand.Mirrors) {
+        return $filepath
     }
     Write-Err "下载失败（所有镜像和原始地址均不可用）"
     return $null
@@ -926,7 +1675,7 @@ function Install-Update {
         # ===== 完整包 =====
         Write-Info '完整更新包'
         Set-State -Phase 'full_install' -Version $UpdateInfo.Version
-        # 备份保留目录
+        # 备份保留目录（含 resource/cache，避免完整包里的旧资源覆盖本地已更新的资源）
         foreach ($d in $PreserveDirs) {
             $src = Join-Path $ScriptDir $d
             if (Test-Path $src) { Copy-Item -Recurse $src (Join-Path $BackupDir $d) -Force }
@@ -992,56 +1741,29 @@ function Restore-Backup {
 function Update-Resource {
     Write-Step '检查游戏资源更新'
 
-    $localVerPath = Join-Path $ScriptDir 'resource/version.json'
-    $localTime = Get-Date 0
-    if (Test-Path $localVerPath) {
-        try {
-            $localJson = Get-Content $localVerPath -Raw -Encoding UTF8 | ConvertFrom-Json
-            $localTime = [DateTime]::ParseExact($localJson.last_updated, 'yyyy-MM-dd HH:mm:ss.fff', $null)
-        }
-        catch {}
-    }
+    $localTime = Get-LocalResourceTime
+    if (-not $localTime) { $localTime = Get-Date 0 }
     Write-Info "本地资源时间: $($localTime.ToString('yyyy-MM-dd HH:mm:ss'))"
 
-    $remoteJson = Read-ResVersionCache
-    if (-not $remoteJson) {
-        $remoteJson = $null
-        for ($i = 1; $i -le 2; $i++) {
-            if ($i -gt 1) { Write-Info "重试第 $i 次..." }
-            Show-Wait "[$i/2] 正在检查资源版本..."
-            foreach ($ru in @($ResourceVersionUrl, $ResVersionCdnUrl)) {
-                $remoteJson = Invoke-GetJson $ru -TimeoutSec 10
-                if ($remoteJson -and $remoteJson.last_updated) { break }
-            }
-            if ($remoteJson -and $remoteJson.last_updated) { Write-ResVersionCache $remoteJson.last_updated; break }
-        }
-    }
-    else { Write-Info '使用缓存的资源版本' }
-    if (-not $remoteJson -or -not $remoteJson.last_updated) {
+    $remoteTime = Get-RemoteResourceTime
+    if (-not $remoteTime) {
         Write-Warn '无法获取远程资源版本，跳过资源更新'
         return $false
     }
-
-    $remoteTime = [DateTime]::ParseExact($remoteJson.last_updated, 'yyyy-MM-dd HH:mm:ss.fff', $null)
     Write-Info "远程资源时间: $($remoteTime.ToString('yyyy-MM-dd HH:mm:ss'))"
     if ($remoteTime -le $localTime -and -not $Force) { Write-Ok '资源已是最新'; return $true }
 
-    Write-Info "发现新资源 ($($remoteJson.last_updated))"
+    Write-Info "发现新资源 ($($remoteTime.ToString('yyyy-MM-dd HH:mm:ss')))"
     if ($DryRun) { Write-Warn '仅检查模式，跳过资源下载'; return $null }
 
-    # 资源包下载 - 多源多策略重试
+    # 资源包下载：探测线路后按最快顺序下载（约 12MB，无需分片）
     $resZip = Join-Path $TempDir 'MaaResource.zip'
-    $dlOk = $false
-    $resUrls = Build-MirrorUrls $ResourceArchiveUrl -IncludeArchiveOnly -PreferMirror
     if (-not $script:HasPwsh) { Write-Info 'pwsh 不可用，HTTP/2 下载将被跳过' }
-    for ($try = 1; $try -le 2; $try++) {
-        if ($try -gt 1) { Write-Info "资源下载重试第 $try 次..."; Start-Sleep 2 }
-        foreach ($rurl in $resUrls) {
-            if (Start-Download -Url $rurl -OutFile $resZip -DisplayName '游戏资源包') { $dlOk = $true; break }
-            Write-Warn "资源下载源不可用: $rurl"
-        }
-        if ($dlOk) { break }
-    }
+    Write-Info '正在探测下载线路（直连 / 代理 / 镜像）...'
+    $cand = Get-DownloadCandidates -Url $ResourceArchiveUrl
+    $probes = Test-UrlCandidates -Candidates $cand
+    $dlOk = Invoke-CandidateDownload -OutFile $resZip -DisplayName '游戏资源包' -Probes $probes `
+        -DirectUrl $cand.Direct -ProxiedUrl $cand.Proxied -MirrorUrls $cand.Mirrors
     if (-not $dlOk) { Write-Err '资源下载失败'; return $false }
 
     # 解压
@@ -1065,7 +1787,7 @@ function Update-Resource {
         $dest = Join-Path $target $rel
         if ($_.PSIsContainer) { New-Directory $dest } else { New-Directory (Split-Path $dest -Parent); Copy-Item $_.FullName $dest -Force }
     }
-    Write-Ok "资源更新完成 ($($remoteJson.last_updated))"
+    Write-Ok "资源更新完成 ($($remoteTime.ToString('yyyy-MM-dd HH:mm:ss')))"
     return $true
 }
 
@@ -1095,10 +1817,15 @@ function Cleanup-Temp {
 }
 
 # ======== 主流程 ========
+if ($SelfTest) {
+    $ok = Test-ScriptLogic
+    if ($ok) { exit 0 } else { exit 1 }
+}
+
 try {
     # 清旧日志，写新日志
     if (Test-Path $LogFile) { Remove-Item -Force $LogFile -ErrorAction SilentlyContinue }
-    Write-Log 'INFO' "=== MAA 更新脚本 v3.3 启动 ==="
+    Write-Log 'INFO' "=== MAA 更新脚本 v3.4 启动 ==="
     Write-Log 'INFO' "目录: $ScriptDir | 通道: $Channel"
     if ($Force) { Write-Warn '强制更新模式' }
     if ($DryRun) { Write-Warn '仅检查模式（不下载）' }
@@ -1123,7 +1850,7 @@ try {
     # 系统代理检测
     Detect-SystemProxy
 
-    # DNS 加速（解析 + 测速 + hosts/curl-resolve）
+    # DNS 加速（解析 + 测速 + curl --resolve；有代理时自动跳过）
     Initialize-DnsAccel
 
     # 确保 pwsh 可用（HTTP/2 下载）
@@ -1141,33 +1868,14 @@ try {
     # === 资源更新检查（快速版，只查版本号，不下载） ===
     $needResourceUpdate = $false
     if (-not $SkipResource) {
-        $localRp = Join-Path $ScriptDir 'resource/version.json'
-        $localRt = Get-Date 0
-        if (Test-Path $localRp) {
-            try { $localRj = Get-Content $localRp -Raw -Encoding UTF8 | ConvertFrom-Json; $localRt = [DateTime]::ParseExact($localRj.last_updated, 'yyyy-MM-dd HH:mm:ss.fff', $null) } catch {}
-        }
-        # 检查缓存
-        $remoteRj = Read-ResVersionCache
-        if (-not $remoteRj) {
-            for ($i = 1; $i -le 2; $i++) {
-                if ($i -gt 1) { Start-Sleep 1 }
-                Show-Wait "[$i/2] 正在检查资源版本..."
-                foreach ($ru in @($ResourceVersionUrl, $ResVersionCdnUrl)) {
-                    $remoteRj = Invoke-GetJson $ru -TimeoutSec 10
-                    if ($remoteRj -and $remoteRj.last_updated) { break }
-                }
-                if ($remoteRj -and $remoteRj.last_updated) {
-                    Write-ResVersionCache $remoteRj.last_updated; break
-                }
-            }
-        }
-        else { Write-Info '使用缓存的资源版本' }
-        if ($remoteRj -and $remoteRj.last_updated) {
-            $remoteRt = [DateTime]::ParseExact($remoteRj.last_updated, 'yyyy-MM-dd HH:mm:ss.fff', $null)
+        $localRt = Get-LocalResourceTime
+        if (-not $localRt) { $localRt = Get-Date 0 }
+        $remoteRt = Get-RemoteResourceTime
+        if ($remoteRt) {
             if ($remoteRt -gt $localRt -or $Force) { $needResourceUpdate = $true }
             else { Write-Ok '资源已是最新' }
         }
-        else { Write-Warn '无法获取远程资源版本，跳过资源更新（可按上方说明手动安装 PowerShell 7 后重试）' }
+        else { Write-Warn '无法获取远程资源版本，跳过资源更新' }
     }
 
     # === 判断是否需要更新 ===
@@ -1191,13 +1899,15 @@ try {
         if (-not $pkgPath -and $updateInfo.FullAsset -and $updateInfo.Type -eq 'OTA') {
             Write-Warn 'OTA 下载失败，尝试完整包...'
             $fullInfo = @{
-                Version = $updateInfo.Version
-                Type = '完整包'
-                Asset = $updateInfo.FullAsset
+                Version    = $updateInfo.Version
+                Channel    = $updateInfo.Channel
+                Type       = '完整包'
+                Asset      = $updateInfo.FullAsset
                 DetailJson = $updateInfo.DetailJson
-                Arch = $updateInfo.Arch
+                Arch       = $updateInfo.Arch
             }
             $pkgPath = Download-UpdatePackage $fullInfo
+            if ($pkgPath) { $updateInfo = $fullInfo }
         }
 
         # 第三优先级：完整包也失败 → 全量下载覆盖
@@ -1220,7 +1930,7 @@ try {
     }
 
     # 3. 安装版本更新
-    if ($pkgPath) {
+    if ($pkgPath -and $updateInfo) {
         $updateApplied = Install-Update -PackagePath $pkgPath -UpdateInfo $updateInfo
         if (Test-Path $pkgPath) { Remove-Item -Force $pkgPath -ErrorAction SilentlyContinue }
         if (-not $updateApplied -and (Test-Path $BackupDir)) { Restore-Backup }
@@ -1231,7 +1941,7 @@ try {
     }
 
     # 4. 资源更新
-    if ($needResourceUpdate) { Update-Resource }
+    if ($needResourceUpdate) { Update-Resource | Out-Null }
 
     Cleanup-Temp
     Clear-State
@@ -1246,8 +1956,8 @@ try {
 
 }
 catch {
-    Write-Err "更新过程出错"
-    Write-Log 'ERROR' "更新过程出错"
+    Write-Err "更新过程出错: $_"
+    Write-Log 'ERROR' "更新过程出错: $_"
     if (Test-Path $BackupDir) { Restore-Backup }
     Cleanup-Temp
     Clear-State
