@@ -7,7 +7,7 @@
 
 但 GitHub 在国内访问很慢甚至打不开，本项目就是为了解决"下不了、更新不了"的问题。
 
-百度网盘链接： <https://pan.baidu.com/s/19hY9RPK3BkRCC3qPRkHXFA?pwd=1234> 提取码: 1234
+百度网盘链接： <https://pan.baidu.com/s/1zutCrwNS0f4lZ_OUrt1HHg?pwd=1234> 提取码: 1234
 
 ## 两种更新方式对比
 
