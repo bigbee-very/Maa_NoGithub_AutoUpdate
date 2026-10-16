@@ -421,7 +421,11 @@ function Test-ScriptLogic {
     Assert-Same 'beta.2 → 6.19.2 OTA 文件名' 'MAAComponent-OTA-v6.19.2-beta.2_v6.19.2-win-x64.zip' ([string]$fixInfo.Asset.name)
     # ---------- 资源包候选地址 ----------
     $script:MockJson['https://cdn.jsdelivr.net/gh/MaaAssistantArknights/MaaResource@main/resource/version.json'] = [pscustomobject]@{ last_updated = '2026-08-23 01:57:24.000' }
-    $rt = Get-RemoteResourceTime
+    # 自测必须与运行环境无关：临时把资源版本缓存指到不存在的文件，
+    # 否则在真实安装目录里会读到本地缓存，导致断言结果随环境变化
+    $savedResCache = $ResCacheFile
+    $ResCacheFile = Join-Path $env:TEMP "maa_selftest_no_cache_$(Get-Random).json"
+    try { $rt = Get-RemoteResourceTime } finally { $ResCacheFile = $savedResCache }
     Assert-Same '远程资源版本可解析' '2026-08-23 01:57:24' $rt.ToString('yyyy-MM-dd HH:mm:ss')
     Assert-Same '资源时间戳比较：新资源需要更新' $true ($rt -gt (ConvertTo-ResourceTime '2026-08-20 15:52:45'))
 
