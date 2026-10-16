@@ -246,50 +246,65 @@ function Test-DownloadSpeed {
     catch { return -1 }
 }
 
+# 探测各线路的「可用性 + 持续吞吐」。
+# 关键点：不能拿"首批 64KB 的耗时"当网速用。起步 40ms 只说明 TCP 建连快，
+# 不代表 300MB 拉得动（实测见过起步 42ms 但持续只有 127 KB/s 的线路）。
+# 因此这里统一以实测吞吐（KB/s）作为判据，并按吞吐降序排序后返回。
 function Test-UrlCandidates {
-    param($Candidates)
+    param($Candidates, [string]$Label = '下载源')
     $probe = New-Object System.Collections.Generic.List[object]
-    $directMs = -1
-    $proxyMs = -1
+    $directSpeed = -1
+    $proxySpeed = -1
     $mirrorUp = 0
-    $mirrorTotal = @($Candidates.Mirrors).Count
-    $mirrorSkipped = $false
+    $mirrorCount = @($Candidates.Mirrors).Count
+    $mirrorSkipped = 0
+    # 达到这个吞吐（KB/s）才认为"这条线路够了，不必再测镜像"
+    $goodEnoughKBs = 400
 
     # 直连探测失败时再给一次机会：TUN/代理客户端的出口节点轮换会让单次探测偶发失败
     for ($attempt = 1; $attempt -le 2; $attempt++) {
-        $directMs = Test-DownloadSpeed -Url $Candidates.Direct -TimeoutSec 5 -NoProxy -Ms
-        if ($directMs -ge 0) { break }
+        $r = Test-DownloadSpeed -Url $Candidates.Direct -TimeoutSec 6 -TestBytes 256KB -NoProxy
+        if ($r -ne -1) { break }
         if ($attempt -lt 2) { Start-Sleep -Milliseconds 400 }
     }
-    if ($directMs -ge 0) { $probe.Add([pscustomobject]@{ Url = $Candidates.Direct; Ms = $directMs; Route = '直连'; NoProxy = $true }) }
+    if ($r -ne -1) {
+        $directSpeed = [math]::Round($r.SpeedBps / 1024, 1)
+        $probe.Add([pscustomobject]@{ Url = $Candidates.Direct; Kbs = $directSpeed; Ms = $r.Ms; Route = '直连'; NoProxy = $true })
+    }
 
     if ($script:SysProxy) {
-        $proxyMs = Test-DownloadSpeed -Url $Candidates.Proxied -TimeoutSec 5 -Proxy $script:ProxyConfig.ForCurl -Ms
-        if ($proxyMs -ge 0) { $probe.Add([pscustomobject]@{ Url = $Candidates.Proxied; Ms = $proxyMs; Route = '代理'; NoProxy = $false }) }
-    }
-
-    # 只有直连/代理确实很快（<400ms 拿到首批 64KB）时才跳过镜像探测；
-    # 否则镜像可能反而更快，仍然值得测一遍。
-    if (($directMs -ge 0 -and $directMs -lt 400) -or ($proxyMs -ge 0 -and $proxyMs -lt 400)) {
-        $mirrorSkipped = $true
-    }
-    else {
-        foreach ($mu in $Candidates.Mirrors) {
-            $ms = Test-DownloadSpeed -Url $mu -TimeoutSec 5 -NoProxy -Ms
-            if ($ms -ge 0) { $probe.Add([pscustomobject]@{ Url = $mu; Ms = $ms; Route = '镜像'; NoProxy = $true }); $mirrorUp++ }
+        $r2 = Test-DownloadSpeed -Url $Candidates.Proxied -TimeoutSec 6 -TestBytes 256KB -Proxy $script:ProxyConfig.ForCurl
+        if ($r2 -ne -1) {
+            $proxySpeed = [math]::Round($r2.SpeedBps / 1024, 1)
+            $probe.Add([pscustomobject]@{ Url = $Candidates.Proxied; Kbs = $proxySpeed; Ms = $r2.Ms; Route = '代理'; NoProxy = $false })
         }
     }
 
-    if ($directMs -ge 0) { Write-Info "GitHub 直连可用 (${directMs}ms)" } else { Write-Info 'GitHub 直连不可用' }
+    # 直连/代理已经足够快才跳过镜像；否则镜像很可能更快，必须测
+    if (($directSpeed -ge $goodEnoughKBs) -or ($proxySpeed -ge $goodEnoughKBs)) {
+        $mirrorSkipped = $mirrorCount
+    }
+    else {
+        foreach ($mu in $Candidates.Mirrors) {
+            $rm = Test-DownloadSpeed -Url $mu -TimeoutSec 6 -TestBytes 256KB -NoProxy
+            if ($rm -ne -1) {
+                $probe.Add([pscustomobject]@{ Url = $mu; Kbs = [math]::Round($rm.SpeedBps / 1024, 1); Ms = $rm.Ms; Route = '镜像'; NoProxy = $true })
+                $mirrorUp++
+            }
+        }
+    }
+
+    if ($directSpeed -ge 0) { Write-Info "GitHub 直连: ${directSpeed} KB/s" } else { Write-Info 'GitHub 直连不可用' }
     if ($script:SysProxy) {
-        if ($proxyMs -ge 0) { Write-Info "代理线路可用 (${proxyMs}ms)" }
+        if ($proxySpeed -ge 0) { Write-Info "代理线路: ${proxySpeed} KB/s" }
         else { Write-Info '代理线路不可用（代理未开启、已失效，或代理不允许访问 GitHub）' }
     }
-    if ($mirrorSkipped) { Write-Info '已选定直连/代理，跳过镜像探测' }
-    else { Write-Info "镜像可用 $mirrorUp/$mirrorTotal 个" }
+    if ($mirrorSkipped -gt 0) { Write-Info "直连/代理已达 ${goodEnoughKBs} KB/s，跳过 $mirrorSkipped 个镜像探测" }
+    else { Write-Info "镜像可用 $mirrorUp/$mirrorCount 个" }
 
     if ($probe.Count -eq 0) { return @() }
-    return @($probe | Sort-Object Ms)
+    # 按实测吞吐降序：起点快的线路不一定持续快，只有吞吐能说明问题
+    return @($probe | Sort-Object -Property @{ Expression = { [double]$_.Kbs } } -Descending)
 }
 
 function Start-Download {
@@ -835,7 +850,7 @@ if ($probes.Count -eq 0) {
     if ($script:SysProxy) { Write-Warn '所有线路探测失败。如代理对 GitHub 设置了直连/绕过规则，请关闭该规则后重试。' }
     else { Write-Warn '所有线路探测失败，且未检测到代理。请检查网络或开启代理后重试。' }
 }
-else { Write-Info "最快线路: $($probes[0].Url) [$($probes[0].Route), $($probes[0].Ms)ms]" }
+else { Write-Info "最快线路: $($probes[0].Url) [$($probes[0].Route), $($probes[0].Kbs) KB/s]" }
 
 if ($DryRun) {
     Write-Warn '仅检查模式（-DryRun），跳过下载与安装'
