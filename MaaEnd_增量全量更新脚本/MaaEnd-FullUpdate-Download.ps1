@@ -35,7 +35,7 @@ $OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 [System.Net.ServicePointManager]::DefaultConnectionLimit = 8
 
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
-$LogFile = Join-Path $ScriptDir "update.log"
+$LogFile = Join-Path $ScriptDir "update_log.txt"
 $script:HasCurl = $null -ne (Get-Command 'curl.exe' -ErrorAction SilentlyContinue)
 
 $MirrorHosts = @(
@@ -55,6 +55,7 @@ $UpdateScripts = @(
     'MaaEnd-全量更新-静默(beta).bat',
     'MaaEnd-全量更新-Debug(beta).bat',
     '使用前阅读此文件.txt',
+    'update_log.txt',
     'update.log',
     # 隐藏目录和文件保护
     '.update_temp',
@@ -67,7 +68,8 @@ $UpdateScripts = @(
 function Write-Log {
     param([string]$Level, [string]$Message)
     $time = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    Add-Content -Path $LogFile -Value "[$time][$Level] $Message" -Encoding UTF8 -ErrorAction SilentlyContinue
+    # 自测模式只打印，不写文件（否则会在脚本目录留下无意义的 update_log.txt）
+    if (-not $SelfTest) { Add-Content -Path $LogFile -Value "[$time][$Level] $Message" -Encoding UTF8 -ErrorAction SilentlyContinue }
 }
 
 function Write-Step { param([string]$Msg) Write-Host "`n>>> $Msg" -ForegroundColor Magenta; Write-Log 'STEP' $Msg }

@@ -425,6 +425,23 @@ function Test-ScriptLogic {
     Assert-Same '远程资源版本可解析' '2026-08-23 01:57:24' $rt.ToString('yyyy-MM-dd HH:mm:ss')
     Assert-Same '资源时间戳比较：新资源需要更新' $true ($rt -gt (ConvertTo-ResourceTime '2026-08-20 15:52:45'))
 
+    # ---------- 属性访问兼容层（曾经的 P0：pscustomobject 上调 ContainsKey 抛异常） ----------
+    Write-Host '--- Test-HasProperty / Get-ObjectProperty ---' -ForegroundColor Cyan
+    Assert-Same 'hashtable 有属性' $true (Test-HasProperty @{ NoProxy = $true } 'NoProxy')
+    Assert-Same 'hashtable 无属性' $false (Test-HasProperty @{ Url = 'x' } 'NoProxy')
+    Assert-Same 'pscustomobject 有属性' $true (Test-HasProperty ([pscustomobject]@{ NoProxy = $true }) 'NoProxy')
+    Assert-Same 'pscustomobject 无属性' $false (Test-HasProperty ([pscustomobject]@{ Url = 'x' }) 'NoProxy')
+    Assert-Same 'PSCustomObject 上不会误调 ContainsKey' $false (Test-HasProperty ([pscustomobject]@{ Url = 'x' }) 'NoProxy')
+    Assert-Same '取值(hashtable)' $true (Get-ObjectProperty @{ NoProxy = $true } 'NoProxy' $false)
+    Assert-Same '取值(pscustomobject)' $false (Get-ObjectProperty ([pscustomobject]@{ NoProxy = $false }) 'NoProxy' $true)
+    Assert-Same '缺省值' 'def' (Get-ObjectProperty ([pscustomobject]@{ Url = 'x' }) 'Missing' 'def')
+    Assert-Same '$null 安全' 'def' (Get-ObjectProperty $null 'Anything' 'def')
+
+    # 干跑一次候选下载流程：只验证记录遍历与属性读取不抛异常
+    $probeRun = Invoke-CandidateDownload -OutFile (Join-Path $env:TEMP 'maa_should_not_exist.bin') -DisplayName '干跑' `
+        -Probes @([pscustomobject]@{ Url = 'https://127.0.0.1:1/none'; Ms = 1; Route = '直连'; NoProxy = $true }) `
+        -DirectUrl 'https://127.0.0.1:1/none' -ProxiedUrl 'https://127.0.0.1:1/none' -MirrorUrls @('https://127.0.0.1:1/none') -MaxAttempts 1
+    Assert-Same '候选下载流程不抛异常（返回 false）' $false $probeRun
     # ---------- 资源 URL 构造（防止变量名丢失导致 URL 为空） ----------
     Assert-Same '资源仓库变量已定义' 'MaaAssistantArknights/MaaResource' $ResourceRepo
     Assert-Same '资源版本 URL 完整' 'https://raw.githubusercontent.com/MaaAssistantArknights/MaaResource/main/resource/version.json' $ResourceVersionUrl
@@ -606,7 +623,7 @@ function Initialize-DnsAccel {
 $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $TempDir = Join-Path $ScriptDir ".update_temp"
 $BackupDir = Join-Path $ScriptDir ".update_backup"
-$LogFile = Join-Path $ScriptDir "update.log"
+$LogFile = Join-Path $ScriptDir "update_log.txt"
 $StateFile = Join-Path $ScriptDir ".update_state"
 $CacheDir = Join-Path $ScriptDir "cache\api"
 $PwshDir = Join-Path $ScriptDir '.pwsh'
@@ -633,10 +650,13 @@ $PreserveDirs = @('achievement', 'background', 'cache', 'config', 'data', 'debug
 function Show-Wait { param([string]$Msg) Write-Host "  ⏳ $Msg" -ForegroundColor DarkYellow }
 
 # ======== 日志 ========
+# 说明：这里必须把每条日志同时写入 $LogFile，否则 bat 窗口关闭后就没有任何可分析的记录。
 function Write-Log {
     param([string]$Level, [string]$Message)
     $time = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $line = "[$time][$Level] $Message"
+    # 自测模式只打印，不写文件（否则会在脚本目录留下无意义的 update_log.txt）
+    if (-not $SelfTest) { try { Add-Content -Path $LogFile -Value $line -Encoding UTF8 -ErrorAction Stop } catch {} }
     switch ($Level) {
         'INFO' { Write-Host "[信息] $Message" -ForegroundColor Cyan }
         'OK' { Write-Host "[成功] $Message" -ForegroundColor Green }
@@ -662,6 +682,28 @@ function Set-State {
 function Clear-State { if (Test-Path $StateFile) { Remove-Item -Force $StateFile } }
 
 # ======== 工具函数 ========
+# 统一读取属性：同时兼容 hashtable 与 PSCustomObject。
+# 注意：不要在记录对象上调用 .ContainsKey()，hashtable 才有该方法；
+# PSCustomObject 上调用会抛 "does not contain a method named 'ContainsKey'"。
+function Test-HasProperty {
+    param($Object, [string]$Name)
+    if ($null -eq $Object) { return $false }
+    if ($Object -is [System.Collections.IDictionary]) { return $Object.Contains($Name) }
+    return $null -ne $Object.PSObject.Properties[$Name]
+}
+
+function Get-ObjectProperty {
+    param($Object, [string]$Name, $Default = $null)
+    if ($null -eq $Object) { return $Default }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) { return $Object[$Name] }
+        return $Default
+    }
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($prop) { return $prop.Value }
+    return $Default
+}
+
 function New-WebProxyOrNull {
     param([string]$Address)
     # SOCKS 代理无法交给 .NET 使用，返回 $null 表示直连（由 curl 处理代理）
@@ -1138,10 +1180,11 @@ function Invoke-CandidateDownload {
         if ($attempt -ge $MaxAttempts) { break }
         $attempt++
         $tested += $p.Url
-        $label = if ($p.NoProxy) { '直连/镜像' } else { '代理' }
+        $noProxy = [bool](Get-ObjectProperty $p 'NoProxy' $false)
+        $label = if ($noProxy) { '直连/镜像' } else { '代理' }
         if ($attempt -gt 1) { Write-Info "切换下载源 ($label): $($p.Url)" }
         if (Test-Path $OutFile) { Remove-Item -Force $OutFile -ErrorAction SilentlyContinue }
-        $ok = if ($p.ContainsKey('NoProxy') -and $p.NoProxy) {
+        $ok = if ($noProxy) {
             Start-Download -Url $p.Url -OutFile $OutFile -DisplayName $DisplayName -ExpectedSize $ExpectedSize -NoProxy
         } else {
             Start-Download -Url $p.Url -OutFile $OutFile -DisplayName $DisplayName -ExpectedSize $ExpectedSize
@@ -1168,7 +1211,7 @@ function Invoke-CandidateDownload {
         $attempt++
         Write-Info "兜底尝试: $($f.Url)"
         if (Test-Path $OutFile) { Remove-Item -Force $OutFile -ErrorAction SilentlyContinue }
-        $ok = if ($f.NoProxy) {
+        $ok = if ([bool](Get-ObjectProperty $f 'NoProxy' $false)) {
             Start-Download -Url $f.Url -OutFile $OutFile -DisplayName $DisplayName -ExpectedSize $ExpectedSize -NoProxy
         } else {
             Start-Download -Url $f.Url -OutFile $OutFile -DisplayName $DisplayName -ExpectedSize $ExpectedSize
@@ -1823,10 +1866,9 @@ if ($SelfTest) {
 }
 
 try {
-    # 清旧日志，写新日志
-    if (Test-Path $LogFile) { Remove-Item -Force $LogFile -ErrorAction SilentlyContinue }
-    Write-Log 'INFO' "=== MAA 更新脚本 v3.4 启动 ==="
-    Write-Log 'INFO' "目录: $ScriptDir | 通道: $Channel"
+    # 保留历史日志并追加本次会话（日志是最重要的排障依据，不能每次运行都清掉）
+    Write-Log 'INFO' "=== MAA 更新脚本 v3.5 启动 ==="
+    Write-Log 'INFO' "目录: $ScriptDir | 通道: $Channel | PowerShell $($PSVersionTable.PSVersion)"
     if ($Force) { Write-Warn '强制更新模式' }
     if ($DryRun) { Write-Warn '仅检查模式（不下载）' }
     Write-Info "日志: $LogFile"
@@ -1948,7 +1990,9 @@ try {
     Write-Log 'OK' "=== 更新完成 ==="
 
     # === 重启 MAA ===
-    if ($maaWasRunning -and (Test-Path (Join-Path $ScriptDir 'MAA.exe'))) {
+    # 仅当「运行前 MAA 本来在跑」且「本次真的执行了更新」时才重启；
+    # 仅检查模式（-DryRun）不应启动任何程序
+    if ($maaWasRunning -and -not $DryRun -and (Test-Path (Join-Path $ScriptDir 'MAA.exe'))) {
         Write-Info '启动 MAA...'
         Start-Process (Join-Path $ScriptDir 'MAA.exe') -WorkingDirectory $ScriptDir
         Write-Ok 'MAA 已重新启动'
@@ -1956,10 +2000,12 @@ try {
 
 }
 catch {
-    Write-Err "更新过程出错: $_"
-    Write-Log 'ERROR' "更新过程出错: $_"
+    $errDetail = "$_"
+    if ($_.ScriptStackTrace) { $errDetail = "$errDetail`n$($_.ScriptStackTrace)" }
+    Write-Err "更新过程出错: $errDetail"
+    Write-Log 'ERROR' "出错位置: $($_.InvocationInfo.PositionMessage)"
     if (Test-Path $BackupDir) { Restore-Backup }
-    Cleanup-Temp
+    Remove-Item -Recurse -Force $TempDir -ErrorAction SilentlyContinue
     Clear-State
     exit 1
 }
